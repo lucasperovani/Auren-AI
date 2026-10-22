@@ -1,3 +1,4 @@
 - Tasks precisa ser transformada em um kanban (Analysis, To Do, In Progress, Done)
 - As tasks não podem mostrar o formato do tempo como no cron, precisa ser algo bonitinho
 - Corrigir/Remover testes flakiness
+- Melhorar e muito a interface
