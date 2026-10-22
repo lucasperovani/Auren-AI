@@ -16,13 +16,12 @@ use crate::{
 };
 
 /// Execution limits (spec section 12).
-const MAX_ITERATIONS: u32 = 25;
-const MAX_TOOL_CALLS: u32 = 50;
-const MAX_LLM_CALLS: u32 = 40;
-
 pub struct AgentRuntime {
     state: AppState,
     tools: ToolRegistry,
+    /// Tool calls made during the most recent chat exchange, for the
+    /// activity trace shown in the frontend.
+    pub last_tool_trace: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 /// Outcome of a bounded run.
@@ -37,7 +36,23 @@ pub enum RunOutcome {
 impl AgentRuntime {
     pub fn new(state: AppState) -> Self {
         let tools = ToolRegistry::new(&state);
-        Self { state, tools }
+        Self {
+            state,
+            tools,
+            last_tool_trace: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn max_iterations(&self) -> u32 {
+        self.state.config.max_iterations.max(1)
+    }
+
+    fn max_tool_calls(&self) -> u32 {
+        self.state.config.max_tool_calls.max(1)
+    }
+
+    fn max_llm_calls(&self) -> u32 {
+        self.state.config.max_llm_calls.max(1)
     }
 
     /// Execute a task run to completion or a stopping condition.
@@ -101,7 +116,7 @@ impl AgentRuntime {
         let available_tools = self.available_tools(&agent_id).await;
         let mut tool_calls_made: u32 = 0;
 
-        for llm_calls in 0..MAX_ITERATIONS {
+        for llm_calls in 0..self.max_iterations() {
             // A paused/cancelled run stops at the next safe point.
             let current: String = sqlx::query("SELECT status FROM task_runs WHERE id = ?")
                 .bind(run_id)
@@ -118,7 +133,7 @@ impl AgentRuntime {
                 // honestly instead of faking success (spec section 21).
                 return RunOutcome::Failed("no LLM provider configured for this agent".into());
             };
-            if llm_calls >= MAX_LLM_CALLS {
+            if llm_calls >= self.max_llm_calls() {
                 return RunOutcome::LimitReached("llm call limit reached".into());
             }
 
@@ -141,7 +156,7 @@ impl AgentRuntime {
             });
 
             for call in &completion.tool_calls {
-                if tool_calls_made >= MAX_TOOL_CALLS {
+                if tool_calls_made >= self.max_tool_calls() {
                     return RunOutcome::LimitReached("tool call limit reached".into());
                 }
                 tool_calls_made += 1;
@@ -308,6 +323,8 @@ impl AgentRuntime {
     /// LLM interaction: it never creates tasks or invokes tools on its own.
     /// Tasks are created only when explicitly requested and confirmed.
     pub async fn chat(&self, agent_id: &str, conversation_id: &str, _user_message: &str) -> Result<String, String> {
+        // Reset the trace for this exchange.
+        self.last_tool_trace.lock().expect("trace poisoned").clear();
         let provider = self
             .build_provider(agent_id)
             .await
@@ -407,6 +424,13 @@ impl AgentRuntime {
                         if let Err(e) = &result {
                             tracing::warn!(tool = %call.name, error = %e, args = %call.arguments, "chat tool invocation failed");
                         }
+                        // Record the call in the activity trace.
+                        self.last_tool_trace.lock().expect("trace poisoned").push(json!({
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "status": if result.is_ok() { "ok" } else { "error" },
+                            "error": result.as_ref().err().map(|e| e.to_string()),
+                        }));
                         let content = match result {
                             Ok(value) => value.to_string(),
                             Err(e) => format!("tool error: {e}"),
@@ -446,5 +470,132 @@ impl AgentRuntime {
             }
         }
         Err("the assistant used too many tool calls without reaching an answer".into())
+    }
+
+    /// Ask the LLM for a short chat title summarizing the first message.
+    /// Falls back to the caller on any failure.
+    pub async fn summarize_title(&self, agent_id: &str, first_message: &str) -> Result<String, String> {
+        let provider = self.build_provider(agent_id).await.ok_or("no provider")?;
+        let completion = provider
+            .complete(
+                &[
+                    LlmMessage {
+                        role: "system".into(),
+                        content: "Summarize the user's message as a chat title: at most 5 words, in the same language as the message, no quotes, no punctuation at the end. Answer with the title only.".into(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    LlmMessage {
+                        role: "user".into(),
+                        content: first_message.chars().take(500).collect(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ],
+                &[],
+                Some(20),
+            )
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let title = completion.content.trim().trim_matches('"').chars().take(60).collect::<String>();
+        if title.is_empty() {
+            return Err("empty title".into());
+        }
+        Ok(title)
+    }
+
+    /// Run an ad-hoc objective with an agent's configuration (no persisted
+    /// task). Used for subagent delegation: the subagent runs its own
+    /// bounded loop with its own instructions and returns the final answer.
+    pub fn run_ad_hoc<'a>(
+        &'a self,
+        agent_id: &'a str,
+        objective: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(self.run_ad_hoc_inner(agent_id, objective))
+    }
+
+    async fn run_ad_hoc_inner(&self, agent_id: &str, objective: &str) -> Result<String, String> {
+        let provider = self
+            .build_provider(agent_id)
+            .await
+            .ok_or_else(|| "no LLM provider configured for the subagent".to_string())?;
+        let instructions: String = sqlx::query("SELECT instructions FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_optional(&self.state.db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_get("instructions").ok())
+            .unwrap_or_default();
+
+        let mut messages = vec![
+            LlmMessage {
+                role: "system".into(),
+                content: format!(
+                    "{instructions}\n\nYou are completing a delegated objective. Work through \
+                     it with the available tools when needed, then reply with the final result."
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: objective.to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let available_tools = self.available_tools(agent_id).await;
+        let mut tool_calls_made: u32 = 0;
+
+        for _ in 0..self.max_iterations() {
+            let completion = provider
+                .complete(&messages, &available_tools, None)
+                .await
+                .map_err(|e| format!("LLM request failed: {e}"))?;
+
+            if completion.tool_calls.is_empty() {
+                return Ok(completion.content);
+            }
+
+            messages.push(LlmMessage {
+                role: "assistant".into(),
+                content: completion.content.clone(),
+                tool_calls: Some(completion.tool_calls.clone()),
+                tool_call_id: None,
+            });
+
+            for call in &completion.tool_calls {
+                if tool_calls_made >= self.max_tool_calls() {
+                    return Err("tool call limit reached".into());
+                }
+                tool_calls_made += 1;
+
+                let tool_id = self.resolve_tool(agent_id, &call.name).await;
+                let content = match tool_id {
+                    Some(tool_id) => match self.tools.authorize(agent_id, &tool_id, &call.arguments, None).await {
+                        Ok(Authorization::Allowed) => match self.tools.invoke_chat(agent_id, &tool_id, &call.arguments).await {
+                            Ok(value) => value.to_string(),
+                            Err(e) => format!("tool error: {e}"),
+                        },
+                        Ok(Authorization::RequiresApproval { .. }) => {
+                            "this operation requires user approval; report that you could not complete it".into()
+                        }
+                        Ok(Authorization::Denied(reason)) => format!("denied: {reason}"),
+                        Err(e) => format!("authorization error: {e}"),
+                    },
+                    None => format!("tool '{}' is not available to this agent", call.name),
+                };
+                messages.push(LlmMessage {
+                    role: "tool".into(),
+                    content,
+                    tool_calls: None,
+                    tool_call_id: Some(call.id.clone()),
+                });
+            }
+        }
+        Err("iteration limit reached".into())
     }
 }

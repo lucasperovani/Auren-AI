@@ -21,6 +21,14 @@ pub struct AppConfig {
     /// Key used to encrypt credentials at rest (spec section 14). When
     /// empty, a key is derived from the session secret (development only).
     pub credential_encryption_key: String,
+    /// Maximum iterations of a task-run/chat LLM loop.
+    pub max_iterations: u32,
+    /// Maximum tool calls within one execution.
+    pub max_tool_calls: u32,
+    /// Maximum LLM calls within one execution.
+    pub max_llm_calls: u32,
+    /// Delete subagents after a successful delegation (default: keep).
+    pub subagent_auto_delete: bool,
 }
 
 impl AppConfig {
@@ -44,6 +52,21 @@ impl AppConfig {
                 .unwrap_or(10 * 1024 * 1024),
             credential_encryption_key: std::env::var("AUREN_CREDENTIAL_ENCRYPTION_KEY")
                 .unwrap_or_else(|_| session_secret.clone()),
+            max_iterations: std::env::var("AUREN_MAX_ITERATIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25),
+            max_tool_calls: std::env::var("AUREN_MAX_TOOL_CALLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50),
+            max_llm_calls: std::env::var("AUREN_MAX_LLM_CALLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(40),
+            subagent_auto_delete: std::env::var("AUREN_SUBAGENT_AUTO_DELETE")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false),
             session_secret,
         })
     }

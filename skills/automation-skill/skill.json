@@ -1,0 +1,303 @@
+{
+  "schema_version": "1",
+  "id": "automation-skill",
+  "name": "Automation",
+  "version": "1.2.0",
+  "description": "Create, manage, and run scheduled tasks; execute shell commands and Python programs in the workspace; send messages to the user in the interface.",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": [],
+  "required_permissions": [
+    "tasks.manage",
+    "workspace.execute",
+    "notifications.send"
+  ],
+  "tools": [
+    {
+      "tool_name": "task_create",
+      "description": "Create a task. Provide a title, an objective (what to do), and optionally a schedule with a 5-field cron expression (UTC) for recurring work. Use this when the user asks for recurring or scheduled work.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Short task name"
+          },
+          "objective": {
+            "type": "string",
+            "description": "What the task should do when it runs"
+          },
+          "schedule": {
+            "type": "object",
+            "properties": {
+              "cron": {
+                "type": "string",
+                "description": "5-field cron in UTC, e.g. '40 19 * * *' for 16:40 in America/Sao_Paulo"
+              }
+            }
+          },
+          "timezone": {
+            "type": "string",
+            "description": "IANA timezone, e.g. America/Sao_Paulo"
+          }
+        },
+        "required": [
+          "title",
+          "objective"
+        ]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_create"
+    },
+    {
+      "tool_name": "task_list",
+      "description": "List the user's tasks with their schedules and statuses.",
+      "input_schema": {
+        "type": "object"
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_list"
+    },
+    {
+      "tool_name": "task_update",
+      "description": "Update a task's title, objective, or schedule.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          },
+          "schedule": {
+            "type": "object",
+            "properties": {
+              "cron": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "task_id"
+        ]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_update"
+    },
+    {
+      "tool_name": "task_delete",
+      "description": "Permanently delete a task and its schedule.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_delete"
+    },
+    {
+      "tool_name": "task_pause",
+      "description": "Pause a task's future executions.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_pause"
+    },
+    {
+      "tool_name": "task_resume",
+      "description": "Resume a paused task.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_resume"
+    },
+    {
+      "tool_name": "task_run",
+      "description": "Run a task immediately.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_run"
+    },
+    {
+      "tool_name": "exec_shell",
+      "description": "Execute a shell command in the workspace (60s timeout). High risk: requires approval by default.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "exec_shell"
+    },
+    {
+      "tool_name": "exec_python",
+      "description": "Execute a Python program: inline code or a workspace file (60s timeout). High risk: requires approval by default.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Inline Python code"
+          },
+          "file": {
+            "type": "string",
+            "description": "Workspace file to run"
+          }
+        }
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "exec_python"
+    },
+    {
+      "tool_name": "notify_user",
+      "description": "Send a message to the user in the interface (appears as a notification). Use it to report task results, findings, or important information.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "notify_user"
+    },
+    {
+      "tool_name": "subagent_create",
+      "description": "Create a specialized subagent with its own instructions. Use it to delegate focused work (research, analysis, writing) to a dedicated helper.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Subagent name, e.g. 'Researcher'"
+          },
+          "instructions": {
+            "type": "string",
+            "description": "What this subagent is and how it should work"
+          }
+        },
+        "required": [
+          "name",
+          "instructions"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "subagent_create"
+    },
+    {
+      "tool_name": "subagent_delegate",
+      "description": "Delegate an objective to a subagent. The subagent runs with its own instructions and tools, and returns its final result.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string",
+            "description": "What the subagent should accomplish"
+          }
+        },
+        "required": [
+          "subagent_id",
+          "objective"
+        ]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "subagent_delegate"
+    },
+    {
+      "tool_name": "subagent_list",
+      "description": "List the available agents and subagents.",
+      "input_schema": {
+        "type": "object"
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "subagent_list"
+    },
+    {
+      "tool_name": "subagent_delete",
+      "description": "Delete a subagent that is no longer needed. Use it to clean up one-off helpers after their work is done.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id"
+        ]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "subagent_delete"
+    }
+  ]
+}

@@ -173,14 +173,14 @@ pub async fn update_task(
     Ok(Json(row_to_task(&row)))
 }
 
-/// Cancel and archive a task. Active runs are cancelled cooperatively.
+/// Permanently delete a task: cancels active work, removes the schedule,
+/// and deletes the record (runs/steps cascade).
 pub async fn delete_task(
     State(state): State<AppState>,
     user: AuthUser,
     Path(task_id): Path<String>,
 ) -> ApiResult<axum::http::StatusCode> {
-    let svc = TaskService::new(&state);
-    svc.set_status(&user.id, &task_id, "cancelled").await?;
+    TaskService::new(&state).delete(&user.id, &task_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

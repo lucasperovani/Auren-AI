@@ -240,18 +240,29 @@ impl ToolRegistry {
         .await?
         .ok_or(ApiError::NotFound)?;
         let reference: Option<String> = row.get("implementation_ref");
-        // Normalize the bare form ("code_write_file") to the namespaced
-        // builtin form ("builtin.code_write_file") when applicable.
-        let reference = reference.map(|r| {
-            if r.starts_with("builtin.") {
-                r
-            } else {
-                format!("builtin.{r}")
-            }
-        });
         let reference = reference.ok_or_else(|| {
             ApiError::Unprocessable("declarative tool has no implementation reference".into())
         })?;
+
+        // Task-management and subagent tools operate on the user's tasks and
+        // agents through the TaskService; the acting user is resolved from
+        // the agent's owner. Checked before builtin normalization: these
+        // refs are bare names.
+        if reference.starts_with("task_") || reference.starts_with("subagent_") {
+            let owner: String = sqlx::query(
+                "SELECT a.user_id FROM agents a
+                 JOIN agent_skills ask ON ask.agent_id = a.id
+                 JOIN skill_versions sv ON sv.id = ask.skill_version_id
+                 JOIN skills sk ON sk.id = sv.skill_id
+                 WHERE sk.id = ? LIMIT 1",
+            )
+            .bind(row.get::<String, _>("skill_row_id"))
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or(ApiError::NotFound)?
+            .try_get("user_id")?;
+            return super::task_tools::execute_task_tool(&self.state, &reference, args, &owner).await;
+        }
 
         // Integration tools dispatch to the integration modules; they need
         // the connected account passed in the arguments.
@@ -271,6 +282,14 @@ impl ToolRegistry {
             )
             .await;
         }
+
+        // Normalize the bare form ("code_write_file") to the namespaced
+        // builtin form ("builtin.code_write_file") for the builtin dispatch.
+        let reference = if reference.starts_with("builtin.") {
+            reference
+        } else {
+            format!("builtin.{reference}")
+        };
 
         super::builtins::execute_builtin(&self.state, &reference, args).await
     }
@@ -298,6 +317,10 @@ mod tests {
                 workspace_dir: "data/workspace".into(),
                 max_workspace_file_bytes: 1024 * 1024,
                 credential_encryption_key: "k".into(),
+                max_iterations: 25,
+                max_tool_calls: 50,
+                max_llm_calls: 40,
+                subagent_auto_delete: false,
             },
             events: std::sync::Arc::new(crate::events::EventBus::new()),
             ws_tickets: std::sync::Arc::new(crate::events::TicketStore::new()),

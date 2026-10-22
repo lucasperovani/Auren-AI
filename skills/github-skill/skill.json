@@ -1,0 +1,118 @@
+{
+  "schema_version": "1",
+  "id": "github-skill",
+  "name": "GitHub",
+  "version": "1.0.0",
+  "description": "Read and write files in repositories, manage issues, and create pull requests through a connected GitHub account (OAuth or token).",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": ["github"],
+  "required_permissions": ["github.read", "github.write"],
+  "tools": [
+    {
+      "tool_name": "github_list_files",
+      "description": "List files in a repository directory.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "path": { "type": "string", "description": "Directory path; empty for the root" },
+          "branch": { "type": "string" }
+        },
+        "required": ["owner", "repo"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_list_files"
+    },
+    {
+      "tool_name": "github_read_file",
+      "description": "Read a file's content from a repository.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "path": { "type": "string" }
+        },
+        "required": ["owner", "repo", "path"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_read_file"
+    },
+    {
+      "tool_name": "github_write_file",
+      "description": "Create or update a file in a repository (commits via the Contents API). High risk: requires approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "path": { "type": "string" },
+          "content": { "type": "string" },
+          "message": { "type": "string", "description": "Commit message" },
+          "branch": { "type": "string" }
+        },
+        "required": ["owner", "repo", "path", "content"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_write_file"
+    },
+    {
+      "tool_name": "github_list_issues",
+      "description": "List issues in a repository.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "state": { "type": "string", "enum": ["open", "closed", "all"] }
+        },
+        "required": ["owner", "repo"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_list_issues"
+    },
+    {
+      "tool_name": "github_create_issue",
+      "description": "Create an issue in a repository. High risk: requires approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "title": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "required": ["owner", "repo", "title"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_create_issue"
+    },
+    {
+      "tool_name": "github_create_pr",
+      "description": "Create a pull request from a branch. High risk: requires approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "title": { "type": "string" },
+          "head": { "type": "string", "description": "Source branch" },
+          "base": { "type": "string", "description": "Target branch (default main)" },
+          "body": { "type": "string" }
+        },
+        "required": ["owner", "repo", "title", "head"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_create_pr"
+    }
+  ]
+}

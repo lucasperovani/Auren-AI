@@ -119,6 +119,17 @@ async function enterApp() {
   currentUser = await api('POST', '/auth/me', { session_token: sessionToken });
   document.getElementById('user-name').textContent = currentUser.display_name;
   connectWebSocket();
+  // Sidebar collapse toggle (persisted).
+  const sidebar = document.getElementById('sidebar');
+  const collapseBtn = document.getElementById('sidebar-collapse');
+  const applyCollapse = (collapsed) => {
+    sidebar.classList.toggle('collapsed', collapsed);
+    document.body.classList.toggle('sidebar-collapsed', collapsed);
+    collapseBtn.textContent = collapsed ? '▶' : '◀';
+    sessionStorage.setItem('auren_sidebar_collapsed', collapsed ? '1' : '');
+  };
+  collapseBtn.onclick = () => applyCollapse(!sidebar.classList.contains('collapsed'));
+  applyCollapse(sessionStorage.getItem('auren_sidebar_collapsed') === '1');
   navigate(location.hash.replace('#', '') || 'dashboard');
 }
 
@@ -259,8 +270,13 @@ views.chat = async (content) => {
         <div class="chat-list" id="chat-list">
           ${conversations.items.map((c) => `
             <div class="chat-list-item ${c.id === currentConversationId ? 'selected' : ''}" data-conv="${esc(c.id)}">
-              <div class="chat-list-title">${esc(c.title || 'New chat')}</div>
-              <div class="chat-list-meta muted">${esc((c.updated_at || '').slice(0, 16).replace('T', ' '))}</div>
+              <div class="chat-list-row">
+                <div class="chat-list-text">
+                  <div class="chat-list-title">${esc(c.title || 'New chat')}</div>
+                  <div class="chat-list-meta muted">${esc((c.updated_at || '').slice(0, 16).replace('T', ' '))}</div>
+                </div>
+                <button class="chat-delete" data-delete="${esc(c.id)}" title="Delete chat">✕</button>
+              </div>
             </div>`).join('') || '<div class="muted" style="padding:8px; font-size:.85rem">No chats yet</div>'}
         </div>
       </aside>
@@ -308,10 +324,28 @@ views.chat = async (content) => {
 
   // Conversation switching.
   content.querySelectorAll('.chat-list-item').forEach((item) => {
-    item.addEventListener('click', () => {
+    item.addEventListener('click', (e) => {
+      if (e.target.closest('.chat-delete')) return; // delete button handles it
       currentConversationId = item.dataset.conv;
       sessionStorage.setItem('auren_conv', currentConversationId);
       navigate('chat');
+    });
+  });
+  // Delete chats.
+  content.querySelectorAll('.chat-delete').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const convId = btn.dataset.delete;
+      if (!confirm('Delete this chat?')) return;
+      try {
+        await api('DELETE', `/conversations/${convId}`);
+        if (currentConversationId === convId) {
+          currentConversationId = '';
+          sessionStorage.removeItem('auren_conv');
+        }
+        toast('Chat deleted', 'success');
+        navigate('chat');
+      } catch (err) { toast(err.message, 'error'); }
     });
   });
 
@@ -352,8 +386,10 @@ views.chat = async (content) => {
         sessionStorage.setItem('auren_conv', currentConversationId);
       }
       const result = await api('POST', `/conversations/${currentConversationId}/messages`, { content: text });
-      pending.textContent = result.reply;
-      if (result.error) pending.classList.add('error-bubble');
+      pending.remove();
+      const replyBubble = addBubble('assistant', result.reply);
+      if (result.error) replyBubble.classList.add('error-bubble');
+      addToolTrace(replyBubble, result.tool_trace);
       // Update the sidebar in place: move/insert this conversation at the top
       // without re-rendering the chat (which would lose the transcript).
       updateChatSidebar(text.slice(0, 60));
@@ -392,6 +428,7 @@ views.tasks = async (content) => {
             <button class="btn btn-sm btn-secondary" data-action="pause">Pause</button>
             <button class="btn btn-sm btn-secondary" data-action="resume">Resume</button>
             <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
+            <button class="btn btn-sm btn-secondary" data-action="history">History</button>
             <button class="btn btn-sm btn-danger" data-action="delete">Delete</button>
             <button class="btn btn-sm btn-danger" data-action="cancel">Cancel</button>
           </td>
@@ -451,6 +488,10 @@ views.tasks = async (content) => {
           showForm(task);
           return;
         }
+        if (action === 'history') {
+          showRunHistory(taskId, items.find((t) => t.id === taskId));
+          return;
+        }
         if (action === 'delete') {
           if (!confirm('Delete this task?')) return;
           await api('DELETE', `/tasks/${taskId}`);
@@ -467,6 +508,62 @@ views.tasks = async (content) => {
     });
   });
 };
+
+/// Show a task's execution history: when each run happened, its status, the
+/// result, and the recorded steps (tool calls with parameters and outputs).
+async function showRunHistory(taskId, task) {
+  const container = document.getElementById('task-form-container');
+  container.innerHTML = '<div class="card" style="margin:16px 0"><p class="muted">Loading history…</p></div>';
+  try {
+    const { items: runs } = await api('GET', `/tasks/${taskId}/runs?limit=20`);
+    const rows = await Promise.all(runs.map(async (run) => {
+      let stepsHtml = '<div class="muted" style="font-size:.85rem">No recorded steps</div>';
+      try {
+        const { items: steps } = await api('GET', `/task-runs/${run.id}/steps?limit=50`);
+        if (steps.length) {
+          stepsHtml = steps.map((s) => `
+            <details class="run-step">
+              <summary>Step ${s.step_index} — <span class="badge ${esc(s.status)}">${esc(s.status)}</span></summary>
+              <div class="run-step-body">
+                <div><strong>Input:</strong></div>
+                <pre>${esc(JSON.stringify(s.input, null, 2))}</pre>
+                ${s.output ? `<div><strong>Output:</strong></div><pre>${esc(JSON.stringify(s.output, null, 2))}</pre>` : ''}
+                ${s.error_message ? `<div class="error">${esc(s.error_message)}</div>` : ''}
+              </div>
+            </details>`).join('');
+        }
+      } catch { /* steps unavailable */ }
+      return `
+        <details class="run-entry">
+          <summary>
+            <span class="badge ${esc(run.status)}">${esc(run.status)}</span>
+            <span class="muted" style="font-size:.85rem">
+              ${esc(run.trigger)} · started ${esc((run.started_at || '—').slice(0, 19).replace('T', ' '))}
+              ${run.finished_at ? `· finished ${esc(run.finished_at.slice(0, 19).replace('T', ' '))}` : ''}
+            </span>
+          </summary>
+          <div class="run-step-body">
+            ${run.result ? `<div><strong>Result:</strong></div><pre>${esc(JSON.stringify(run.result, null, 2))}</pre>` : ''}
+            ${run.error_message ? `<div class="error">${esc(run.error_message)}</div>` : ''}
+            <div style="margin-top:8px"><strong>Steps:</strong></div>
+            ${stepsHtml}
+          </div>
+        </details>`;
+    }));
+    container.innerHTML = `
+      <div class="card" style="margin:16px 0">
+        <div style="display:flex; align-items:center; gap:10px">
+          <h3>Execution history — ${esc(task?.title || '')}</h3>
+          <span class="spacer"></span>
+          <button class="btn btn-sm btn-secondary" id="history-close">Close</button>
+        </div>
+        ${runs.length ? rows.join('') : '<div class="empty-state">This task has not run yet.</div>'}
+      </div>`;
+    document.getElementById('history-close').addEventListener('click', () => { container.innerHTML = ''; });
+  } catch (err) {
+    container.innerHTML = `<div class="card" style="margin:16px 0"><p class="error">Failed to load history: ${esc(err.message)}</p></div>`;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Skills
@@ -950,10 +1047,45 @@ function addBubble(role, text) {
   const container = document.getElementById('chat-messages');
   const bubble = document.createElement('div');
   bubble.className = `chat-bubble ${role}`;
-  bubble.textContent = text;
+  if (role === 'assistant' && window.marked) {
+    // Assistant messages render as markdown; user messages stay plain text.
+    bubble.innerHTML = marked.parse(text ?? '');
+  } else {
+    bubble.textContent = text;
+  }
   container.appendChild(bubble);
   container.scrollTop = container.scrollHeight;
   return bubble;
+}
+
+/// Render an expandable tool-call trace under an assistant bubble.
+function addToolTrace(bubble, trace) {
+  if (!trace || !trace.length) return;
+  const container = document.getElementById('chat-messages');
+  const details = document.createElement('details');
+  details.className = 'tool-trace';
+  const summary = document.createElement('summary');
+  summary.textContent = `🔧 ${trace.length} tool call${trace.length > 1 ? 's' : ''}`;
+  details.appendChild(summary);
+  for (const call of trace) {
+    const item = document.createElement('div');
+    item.className = 'tool-trace-item';
+    const statusIcon = call.status === 'ok' ? '✓' : '✗';
+    item.innerHTML = `<div class="tool-trace-head">${statusIcon} <code>${esc(call.tool)}</code></div>`;
+    const params = document.createElement('pre');
+    params.className = 'tool-trace-params';
+    params.textContent = JSON.stringify(call.arguments, null, 2);
+    item.appendChild(params);
+    if (call.error) {
+      const err = document.createElement('div');
+      err.className = 'tool-trace-error';
+      err.textContent = call.error;
+      item.appendChild(err);
+    }
+    details.appendChild(item);
+  }
+  container.appendChild(details);
+  container.scrollTop = container.scrollHeight;
 }
 
 // ---------------------------------------------------------------------------

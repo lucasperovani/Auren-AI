@@ -246,6 +246,38 @@ impl TaskService {
         Ok(run_id)
     }
 
+    /// Permanently delete a task: cancels active work, removes the schedule,
+    /// and deletes the record. Runs/steps are removed by the FK cascade.
+    pub async fn delete(&self, user_id: &str, task_id: &str) -> Result<(), ApiError> {
+        self.require_owned(user_id, task_id).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = self.db.begin().await.map_err(ApiError::from)?;
+        // Cancel queued work first so the worker never picks a deleted task.
+        sqlx::query(
+            "UPDATE queued_jobs SET status = 'cancelled'
+             WHERE task_run_id IN (SELECT id FROM task_runs WHERE task_id = ?)
+               AND status IN ('pending', 'leased')",
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM scheduled_jobs WHERE task_id = ?")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM tasks WHERE id = ?")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await.map_err(ApiError::from)?;
+        self.events.publish(EventEnvelope::new(
+            "task.cancelled",
+            json!({ "task_id": task_id, "deleted": true }),
+        ));
+        let _ = now;
+        Ok(())
+    }
+
     /// Fetch a task owned by the user or return 404 (ownership enforcement).
     pub async fn require_owned(&self, user_id: &str, task_id: &str) -> Result<String, ApiError> {
         let row = sqlx::query("SELECT user_id, status FROM tasks WHERE id = ?")
@@ -283,6 +315,10 @@ mod tests {
                 workspace_dir: "data/workspace".into(),
                 max_workspace_file_bytes: 1024 * 1024,
                 credential_encryption_key: "k".into(),
+                max_iterations: 25,
+                max_tool_calls: 50,
+                max_llm_calls: 40,
+                subagent_auto_delete: false,
             },
             events: std::sync::Arc::new(crate::events::EventBus::new()),
             ws_tickets: std::sync::Arc::new(crate::events::TicketStore::new()),

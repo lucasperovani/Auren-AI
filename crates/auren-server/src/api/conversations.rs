@@ -314,12 +314,36 @@ pub async fn post_message(
         .execute(&state.db)
         .await?;
 
+    // First message of the conversation: ask the LLM for a short title;
+    // fall back to the date/time when unavailable.
+    let message_count: i64 = sqlx::query("SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ?")
+        .bind(&conversation_id)
+        .fetch_one(&state.db)
+        .await?
+        .get("c");
+    if message_count <= 2 {
+        let title = match runtime.summarize_title(&agent_id, req.content.trim()).await {
+            Ok(t) => t,
+            Err(_) => chrono::Local::now().format("%d/%m %H:%M").to_string(),
+        };
+        sqlx::query("UPDATE conversations SET title = ? WHERE id = ?")
+            .bind(&title)
+            .bind(&conversation_id)
+            .execute(&state.db)
+            .await?;
+    }
+
+    // Collect the tool calls made during this exchange for the activity
+    // trace shown in the frontend.
+    let tool_trace = runtime.last_tool_trace.lock().expect("trace poisoned").clone();
+
     Ok((
         axum::http::StatusCode::OK,
         Json(json!({
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
             "reply": reply,
+            "tool_trace": tool_trace,
         })),
     ))
 }

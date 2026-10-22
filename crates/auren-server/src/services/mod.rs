@@ -10,6 +10,7 @@ pub mod agent_runtime;
 pub mod builtins;
 pub mod credentials;
 pub mod google_oauth;
+pub mod github_oauth;
 pub mod integrations;
 pub mod llm;
 pub mod mcp;
@@ -17,6 +18,7 @@ pub mod notifications;
 pub mod scheduler;
 pub mod skill_installer;
 pub mod task;
+pub mod task_tools;
 pub mod tool_registry;
 pub mod worker;
 

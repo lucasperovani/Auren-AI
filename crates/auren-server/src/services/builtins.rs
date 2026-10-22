@@ -5,6 +5,8 @@
 //! workspace restrictions as installed skills.
 
 use serde_json::{json, Value};
+use sqlx::Row;
+use std::time::Duration;
 
 use crate::{error::ApiError, state::AppState};
 
@@ -30,6 +32,18 @@ pub async fn execute_builtin(
         "builtin.code_edit_block" => code_edit_block(state, args).await,
         "builtin.code_list_dir" => code_list_dir(state, args).await,
         "builtin.code_search" => code_search(state, args).await,
+        // Execution tools: shell commands and Python programs in the workspace.
+        "builtin.exec_shell" => exec_shell(state, args).await,
+        "builtin.exec_python" => exec_python(state, args).await,
+        // User-facing notification (appears in the frontend).
+        "builtin.notify_user" => notify_user(state, args).await,
+        // GitHub tools (OAuth or token auth).
+        "builtin.github_list_files" => github_list_files(state, args).await,
+        "builtin.github_read_file" => github_read_file(state, args).await,
+        "builtin.github_write_file" => github_write_file(state, args).await,
+        "builtin.github_list_issues" => github_list_issues(state, args).await,
+        "builtin.github_create_issue" => github_create_issue(state, args).await,
+        "builtin.github_create_pr" => github_create_pr(state, args).await,
         other => Err(ApiError::Unprocessable(format!("unknown builtin '{other}'"))),
     }
 }
@@ -354,6 +368,277 @@ fn search_code_recursive(dir: &std::path::Path, query: &str, matches: &mut Vec<V
     }
 }
 
+// ---------------------------------------------------------------------------
+// Execution tools: shell commands and Python programs, confined to the
+// workspace with hard timeouts. These are high-risk tools: the skill
+// manifests declare them as such, so the permission engine requires
+// approval by default (spec part1 section 4: code execution is an
+// explicit, separately permissioned capability).
+// ---------------------------------------------------------------------------
+
+/// Maximum output captured from a command.
+const MAX_EXEC_OUTPUT: usize = 100_000;
+/// Hard timeout for command execution.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run a shell command with its working directory set to the workspace.
+async fn exec_shell(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let command = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::Unprocessable("command is required".into()))?;
+    // Reject obvious host-level dangers regardless of policy.
+    for forbidden in ["rm -rf /", "mkfs", "dd if=", ":(){", "> /dev/sda", "shutdown", "reboot"] {
+        if command.contains(forbidden) {
+            return Err(ApiError::Forbidden("command rejected by safety policy".into()));
+        }
+    }
+    let workspace = state.config.workspace_dir.clone();
+    let output = tokio::time::timeout(
+        EXEC_TIMEOUT,
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&workspace)
+            .output(),
+    )
+    .await
+    .map_err(|_| ApiError::Conflict("command timed out after 60s".into()))?
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("command execution failed: {e}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(json!({
+        "exit_code": output.status.code(),
+        "stdout": stdout.chars().take(MAX_EXEC_OUTPUT).collect::<String>(),
+        "stderr": stderr.chars().take(MAX_EXEC_OUTPUT).collect::<String>(),
+    }))
+}
+
+/// Run a Python program: either inline code or a workspace file.
+async fn exec_python(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let code = args.get("code").and_then(|v| v.as_str());
+    let file = args.get("file").and_then(|v| v.as_str());
+    let workspace = state.config.workspace_dir.clone();
+
+    let mut command = tokio::process::Command::new("python3");
+    command.current_dir(&workspace);
+    if let Some(code) = code {
+        command.arg("-c").arg(code);
+    } else if let Some(file) = file {
+        let resolved = resolve_workspace_path(state, file)?;
+        command.arg(&resolved);
+    } else {
+        return Err(ApiError::Unprocessable("either 'code' or 'file' is required".into()));
+    }
+    let output = tokio::time::timeout(EXEC_TIMEOUT, command.output())
+        .await
+        .map_err(|_| ApiError::Conflict("python execution timed out after 60s".into()))?
+        .map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!("python execution failed: {e}"))
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(json!({
+        "exit_code": output.status.code(),
+        "stdout": stdout.chars().take(MAX_EXEC_OUTPUT).collect::<String>(),
+        "stderr": stderr.chars().take(MAX_EXEC_OUTPUT).collect::<String>(),
+    }))
+}
+
+/// Send a message to the user in the frontend: persists a notification and
+/// broadcasts it over the WebSocket channel.
+async fn notify_user(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let title = args.get("title").and_then(|v| v.as_str()).ok_or_else(|| {
+        ApiError::Unprocessable("title is required".into())
+    })?;
+    let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let user_id = args.get("user_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let service = crate::services::notifications::NotificationService::new(state);
+    let id = service
+        .create(user_id, "agent_message", title, body, None, None, None)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(json!({ "notification_id": id, "delivered": true }))
+}
+
+// ---------------------------------------------------------------------------
+// GitHub tools (spec: communications with GitHub, OAuth when configured).
+// The token comes from a connected `github` integration account.
+// ---------------------------------------------------------------------------
+
+const GITHUB_API: &str = "https://api.github.com";
+
+/// Resolve the GitHub token from the connected account in the arguments.
+async fn github_token(state: &AppState, args: &Value) -> Result<String, ApiError> {
+    let account_id = args
+        .get("integration_account_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ApiError::Conflict("connect a GitHub account in the Integrations view first".into())
+        })?;
+    let row = sqlx::query(
+        "SELECT c.ciphertext, c.nonce FROM encrypted_credentials c
+         JOIN integration_accounts a ON a.id = c.integration_account_id
+         WHERE c.integration_account_id = ? AND a.status = 'active'",
+    )
+    .bind(account_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::Conflict("GitHub account is not connected or is inactive".into()))?;
+    let ct: Vec<u8> = row.get("ciphertext");
+    let nonce: Vec<u8> = row.get("nonce");
+    crate::services::credentials::decrypt_credential(&ct, &nonce, &state.config.credential_encryption_key)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("credential decryption failed")))
+}
+
+/// GitHub API request with the account's token.
+async fn github_api(
+    state: &AppState,
+    args: &Value,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, ApiError> {
+    let token = github_token(state, args).await?;
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{GITHUB_API}{path}"))
+        .bearer_auth(&token)
+        .header("User-Agent", "auren-ai")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(b) = body {
+        request = request.json(&b);
+    }
+    let response = request.send().await.map_err(|e| {
+        tracing::debug!(error = %e, "github api request failed");
+        ApiError::ServiceUnavailable
+    })?;
+    let status = response.status();
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            Err(ApiError::Conflict("GitHub token rejected; reconnect the account".into()))
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Err(ApiError::TooManyRequests),
+        s if s.is_success() => {
+            let value: Value = response.json().await.unwrap_or(json!({}));
+            Ok(value)
+        }
+        // 204 No Content is success with no body.
+        reqwest::StatusCode::NO_CONTENT => Ok(json!({ "ok": true })),
+        s => {
+            let body = response.text().await.unwrap_or_default();
+            tracing::debug!(status = s.as_u16(), body = %body, "github api error");
+            Err(ApiError::Conflict(format!("GitHub API returned HTTP {}", s.as_u16())))
+        }
+    }
+}
+
+async fn github_list_files(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let owner = args.get("owner").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("owner is required".into()))?;
+    let repo = args.get("repo").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("repo is required".into()))?;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+    let ref_param = if branch.is_empty() { String::new() } else { format!("?ref={}", urlencode(branch)) };
+    let result = github_api(state, args, reqwest::Method::GET, &format!("/repos/{owner}/{repo}/contents/{}{}", urlencode(path), ref_param), None).await?;
+    if let Some(items) = result.as_array() {
+        Ok(json!({
+            "items": items.iter().map(|i| json!({
+                "name": i.get("name"),
+                "path": i.get("path"),
+                "type": i.get("type"),
+                "size": i.get("size"),
+            })).collect::<Vec<_>>()
+        }))
+    } else {
+        Ok(json!({ "file": { "path": result.get("path"), "size": result.get("size") } }))
+    }
+}
+
+async fn github_read_file(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let owner = args.get("owner").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("owner is required".into()))?;
+    let repo = args.get("repo").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("repo is required".into()))?;
+    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("path is required".into()))?;
+    let result = github_api(state, args, reqwest::Method::GET, &format!("/repos/{owner}/{repo}/contents/{}", urlencode(path)), None).await?;
+    // Content arrives base64-encoded.
+    let encoded = result.get("content").and_then(|c| c.as_str()).unwrap_or_default();
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.replace('\n', ""))
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+    Ok(json!({ "path": result.get("path"), "content": decoded, "sha": result.get("sha") }))
+}
+
+/// Create or update a file in a repository (commits via the Contents API).
+async fn github_write_file(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let owner = args.get("owner").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("owner is required".into()))?;
+    let repo = args.get("repo").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("repo is required".into()))?;
+    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("path is required".into()))?;
+    let content = args.get("content").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("content is required".into()))?;
+    let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("Update via Auren-AI");
+    let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    let mut body = json!({ "message": message, "content": encoded });
+    if !branch.is_empty() {
+        body["branch"] = json!(branch);
+    }
+    // Updating an existing file requires its current sha.
+    let existing = github_api(state, args, reqwest::Method::GET, &format!("/repos/{owner}/{repo}/contents/{}", urlencode(path)), None).await;
+    if let Ok(sha) = existing.and_then(|r| r.get("sha").and_then(|s| s.as_str().map(|s| s.to_string())).ok_or(ApiError::NotFound)) {
+        body["sha"] = json!(sha);
+    }
+    let result = github_api(state, args, reqwest::Method::PUT, &format!("/repos/{owner}/{repo}/contents/{}", urlencode(path)), Some(body)).await?;
+    Ok(json!({
+        "committed": true,
+        "path": result.get("content").and_then(|c| c.get("path")).cloned().unwrap_or(Value::Null),
+        "commit_sha": result.get("commit").and_then(|c| c.get("sha")).cloned().unwrap_or(Value::Null),
+    }))
+}
+
+async fn github_list_issues(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let owner = args.get("owner").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("owner is required".into()))?;
+    let repo = args.get("repo").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("repo is required".into()))?;
+    let result = github_api(state, args, reqwest::Method::GET, &format!("/repos/{owner}/{repo}/issues?state={}", args.get("state").and_then(|v| v.as_str()).unwrap_or("open")), None).await?;
+    Ok(json!({
+        "issues": result.as_array().cloned().unwrap_or_default().iter().map(|i| json!({
+            "number": i.get("number"),
+            "title": i.get("title"),
+            "state": i.get("state"),
+        })).collect::<Vec<_>>()
+    }))
+}
+
+async fn github_create_issue(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let owner = args.get("owner").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("owner is required".into()))?;
+    let repo = args.get("repo").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("repo is required".into()))?;
+    let title = args.get("title").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("title is required".into()))?;
+    let result = github_api(state, args, reqwest::Method::POST, &format!("/repos/{owner}/{repo}/issues"), Some(json!({
+        "title": title,
+        "body": args.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+    }))).await?;
+    Ok(json!({ "issue_number": result.get("number"), "url": result.get("html_url") }))
+}
+
+/// Create a pull request from a branch.
+async fn github_create_pr(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let owner = args.get("owner").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("owner is required".into()))?;
+    let repo = args.get("repo").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("repo is required".into()))?;
+    let title = args.get("title").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("title is required".into()))?;
+    let head = args.get("head").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("head branch is required".into()))?;
+    let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("main");
+    let result = github_api(state, args, reqwest::Method::POST, &format!("/repos/{owner}/{repo}/pulls"), Some(json!({
+        "title": title,
+        "head": head,
+        "base": base,
+        "body": args.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+    }))).await?;
+    Ok(json!({ "pr_number": result.get("number"), "url": result.get("html_url") }))
+}
+
+fn urlencode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +660,10 @@ mod tests {
                 workspace_dir: workspace.to_string_lossy().to_string(),
                 max_workspace_file_bytes: 1024 * 1024,
                 credential_encryption_key: "k".into(),
+                max_iterations: 25,
+                max_tool_calls: 50,
+                max_llm_calls: 40,
+                subagent_auto_delete: false,
             },
             events: std::sync::Arc::new(crate::events::EventBus::new()),
             ws_tickets: std::sync::Arc::new(crate::events::TicketStore::new()),

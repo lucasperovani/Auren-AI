@@ -546,11 +546,31 @@ const KNOWN_BUILTINS: &[&str] = &[
     "builtin.code_edit_block",
     "builtin.code_list_dir",
     "builtin.code_search",
+    "builtin.exec_shell",
+    "builtin.exec_python",
+    "builtin.notify_user",
+    "builtin.github_list_files",
+    "builtin.github_read_file",
+    "builtin.github_write_file",
+    "builtin.github_list_issues",
+    "builtin.github_create_issue",
+    "builtin.github_create_pr",
 ];
 
 /// Integration operations a declarative tool may reference. Dispatched by
 /// the connected account's provider type at execution time.
 const INTEGRATION_OPERATIONS: &[&str] = &[
+    "task_create",
+    "task_list",
+    "task_update",
+    "task_delete",
+    "task_pause",
+    "task_resume",
+    "task_run",
+    "subagent_create",
+    "subagent_delegate",
+    "subagent_list",
+    "subagent_delete",
     "search_messages",
     "read_message",
     "create_draft",

@@ -37,6 +37,7 @@ const CATALOG: &[(&str, &[&str])] = &[
     ("gphotos", &["list_albums", "search_media", "get_media"]),
     ("instagram", &["get_account_info", "list_media", "publish_media"]),
     ("flights", &["search_itineraries", "get_price", "monitor_price", "prepare_booking", "complete_purchase"]),
+    ("github", &["list_files", "read_file", "write_file", "list_issues", "create_issue", "create_pr"]),
 ];
 
 pub async fn catalog() -> Json<serde_json::Value> {
@@ -96,6 +97,15 @@ pub async fn connect(
     // the user can still connect manually with an access token.
     if matches!(provider_type.as_str(), "gmail" | "gcal" | "gphotos") {
         if let Some(auth_url) = crate::services::google_oauth::authorization_url(&state, &user.id, &provider_type).await? {
+            return Ok((
+                axum::http::StatusCode::OK,
+                Json(json!({ "oauth_url": auth_url, "flow": "oauth" })),
+            ));
+        }
+    }
+    // GitHub uses its own OAuth flow when configured.
+    if provider_type == "github" {
+        if let Some(auth_url) = crate::services::github_oauth::authorization_url(&state, &user.id).await? {
             return Ok((
                 axum::http::StatusCode::OK,
                 Json(json!({ "oauth_url": auth_url, "flow": "oauth" })),
@@ -178,8 +188,12 @@ pub async fn oauth_callback(
         return Err(ApiError::Forbidden("state does not belong to this user".into()));
     }
 
-    // Exchange the code for tokens (consumes the state; stores encrypted).
-    let (integration_id, account_id) = crate::services::google_oauth::exchange_code(&state, oauth_state, code).await?;
+    // Exchange the code for tokens with the provider-specific flow (consumes
+    // the state; stores encrypted credentials).
+    let (integration_id, account_id) = match flow["provider_type"].as_str() {
+        Some("github") => crate::services::github_oauth::exchange_code(&state, oauth_state, code).await?,
+        _ => crate::services::google_oauth::exchange_code(&state, oauth_state, code).await?,
+    };
     Ok(Json(json!({
         "status": "connected",
         "integration_id": integration_id,
