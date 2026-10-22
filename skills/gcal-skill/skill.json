@@ -1,0 +1,88 @@
+{
+  "schema_version": "1",
+  "id": "gcal-skill",
+  "name": "Google Calendar",
+  "version": "1.0.0",
+  "description": "Read, search, create, update, and cancel events on the connected Google Calendar.",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": ["gcal"],
+  "required_permissions": ["calendar.read", "calendar.write"],
+  "tools": [
+    {
+      "tool_name": "gcal_list_events",
+      "description": "List upcoming events on the primary calendar.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "max_results": { "type": "integer" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "list_events"
+    },
+    {
+      "tool_name": "gcal_search_events",
+      "description": "Search events by text query.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" }
+        },
+        "required": ["query"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "search_events"
+    },
+    {
+      "tool_name": "gcal_create_event",
+      "description": "Create a calendar event with start and end times (RFC 3339).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "summary": { "type": "string" },
+          "start": { "type": "string", "description": "Start time, RFC 3339" },
+          "end": { "type": "string", "description": "End time, RFC 3339" }
+        },
+        "required": ["summary", "start", "end"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "create_event"
+    },
+    {
+      "tool_name": "gcal_update_event",
+      "description": "Update an existing event's summary or times.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "event_id": { "type": "string" },
+          "summary": { "type": "string" },
+          "start": { "type": "string" },
+          "end": { "type": "string" }
+        },
+        "required": ["event_id"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "update_event"
+    },
+    {
+      "tool_name": "gcal_cancel_event",
+      "description": "Cancel (delete) a calendar event. Requires approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "event_id": { "type": "string" }
+        },
+        "required": ["event_id"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "cancel_event"
+    }
+  ]
+}

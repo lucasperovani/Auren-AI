@@ -1,0 +1,49 @@
+{
+  "schema_version": "1",
+  "id": "gphotos-skill",
+  "name": "Google Photos",
+  "version": "1.0.0",
+  "description": "List albums and search media items through the official Google Photos Library API.",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": ["gphotos"],
+  "required_permissions": ["photos.read"],
+  "tools": [
+    {
+      "tool_name": "gphotos_list_albums",
+      "description": "List the account's albums.",
+      "input_schema": { "type": "object" },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "list_albums"
+    },
+    {
+      "tool_name": "gphotos_search_media",
+      "description": "Search media items, optionally within an album.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "album_id": { "type": "string", "description": "Optional album to restrict the search" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "search_media"
+    },
+    {
+      "tool_name": "gphotos_get_media",
+      "description": "Retrieve one media item's metadata.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "media_id": { "type": "string" }
+        },
+        "required": ["media_id"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "get_media"
+    }
+  ]
+}

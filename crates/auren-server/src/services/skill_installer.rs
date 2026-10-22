@@ -266,9 +266,16 @@ impl SkillInstallationService {
                         "tool '{tool_name}': builtin_ref requires implementation_ref"
                     )));
                 }
-                // Declarative tools must reference a known builtin.
+                // Declarative tools must reference a known builtin or an
+                // integration operation (dispatched by provider type at
+                // execution time).
                 if let Some(r) = &impl_ref {
-                    if !KNOWN_BUILTINS.contains(&r.as_str()) {
+                    // Accept both "builtin.x" and the bare "x" form.
+                    let bare = r.strip_prefix("builtin.").unwrap_or(r);
+                    let is_builtin = KNOWN_BUILTINS.contains(&r.as_str())
+                        || KNOWN_BUILTINS.iter().any(|k| k.strip_prefix("builtin.") == Some(bare));
+                    let is_integration_operation = INTEGRATION_OPERATIONS.contains(&r.as_str());
+                    if !is_builtin && !is_integration_operation {
                         return Err(ApiError::Unprocessable(format!(
                             "tool '{tool_name}' references unknown implementation '{r}'"
                         )));
@@ -534,6 +541,36 @@ const KNOWN_BUILTINS: &[&str] = &[
     "builtin.file_delete",
     "builtin.file_search",
     "builtin.web_fetch",
+    "builtin.code_read_file",
+    "builtin.code_write_file",
+    "builtin.code_edit_block",
+    "builtin.code_list_dir",
+    "builtin.code_search",
+];
+
+/// Integration operations a declarative tool may reference. Dispatched by
+/// the connected account's provider type at execution time.
+const INTEGRATION_OPERATIONS: &[&str] = &[
+    "search_messages",
+    "read_message",
+    "create_draft",
+    "send_message",
+    "list_events",
+    "search_events",
+    "create_event",
+    "update_event",
+    "cancel_event",
+    "list_albums",
+    "search_media",
+    "get_media",
+    "get_account_info",
+    "list_media",
+    "publish_media",
+    "search_itineraries",
+    "get_price",
+    "monitor_price",
+    "prepare_booking",
+    "complete_purchase",
 ];
 
 fn valid_skill_id(id: &str) -> bool {

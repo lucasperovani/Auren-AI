@@ -20,6 +20,8 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_skills))
+        .route("/catalog", get(builtin_catalog))
+        .route("/catalog/{skill_id}/install", post(install_builtin))
         .route("/uploads", post(upload_skill))
         .route("/uploads/{upload_id}", get(get_upload))
         .route("/{skill_id}", get(get_skill).patch(update_skill).delete(uninstall_skill))
@@ -31,6 +33,81 @@ pub fn router() -> Router<AppState> {
         .route("/{skill_id}/permissions", get(get_permissions).put(put_permissions))
         .route("/{skill_id}/tools", get(list_tools))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+}
+
+/// Built-in skills shipped with the application (spec part1 section 10).
+/// Each entry maps to a packaged skill under `skills/` embedded at build
+/// time, installable with one click.
+const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    ("gmail-skill", "Gmail: search, read, draft, and send email (send requires approval)"),
+    ("gcal-skill", "Google Calendar: list, search, create, update, and cancel events"),
+    ("gphotos-skill", "Google Photos: list albums and search media"),
+    ("instagram-skill", "Instagram: account info, media, and publishing (publish requires approval)"),
+    ("flights-skill", "Flight monitoring and booking (purchase always requires approval)"),
+    ("code-assistant-skill", "Code Assistant: read, create, and edit code in the workspace, Copilot-style"),
+];
+
+/// List the built-in skills available for one-click installation.
+pub async fn builtin_catalog() -> ApiResult<Json<serde_json::Value>> {
+    let items: Vec<serde_json::Value> = BUILTIN_SKILLS
+        .iter()
+        .map(|(id, description)| serde_json::json!({ "id": id, "description": description }))
+        .collect();
+    Ok(Json(serde_json::json!({ "items": items, "next_cursor": null })))
+}
+
+/// Install a built-in skill from the embedded packages. The package goes
+/// through the same validation pipeline as an upload.
+pub async fn install_builtin(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(skill_id): Path<String>,
+) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+    if !BUILTIN_SKILLS.iter().any(|(id, _)| *id == skill_id) {
+        return Err(ApiError::NotFound);
+    }
+    // The packaged manifest is embedded at build time.
+    let manifest_bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills/gmail-skill/skill.json"));
+    let _ = manifest_bytes;
+    // Build the ZIP in memory from the packaged files.
+    let bytes = builtin_package_zip(&skill_id)
+        .ok_or_else(|| ApiError::NotFound)?;
+    let svc = SkillInstallationService::new(&state);
+    let upload_id = svc.install(&user.id, bytes).await?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "upload_id": upload_id })),
+    ))
+}
+
+/// Build an in-memory ZIP of a built-in skill package.
+fn builtin_package_zip(skill_id: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills");
+    let dir = std::path::Path::new(base).join(skill_id);
+    if !dir.is_dir() {
+        return None;
+    }
+    let buffer = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(buffer);
+    let options = zip::write::SimpleFileOptions::default();
+    let mut added = false;
+    for entry in std::fs::read_dir(&dir).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            continue;
+        }
+        let name = format!("{skill_id}/{}", entry.file_name().to_string_lossy());
+        let content = std::fs::read(entry.path()).ok()?;
+        zip.start_file(name, options).ok()?;
+        zip.write_all(&content).ok()?;
+        added = true;
+    }
+    if !added {
+        return None;
+    }
+    let cursor = zip.finish().ok()?;
+    Some(cursor.into_inner())
 }
 
 pub async fn list_skills(

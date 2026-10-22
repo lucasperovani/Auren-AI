@@ -1,0 +1,96 @@
+{
+  "schema_version": "1",
+  "id": "flights-skill",
+  "name": "Flight Monitoring",
+  "version": "1.0.0",
+  "description": "Monitor flight prices and prepare bookings. Purchasing is separated from monitoring and always requires explicit approval of the exact itinerary and price.",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": ["flights"],
+  "required_permissions": ["flights.monitor", "flights.purchase"],
+  "tools": [
+    {
+      "tool_name": "flights_search_itineraries",
+      "description": "Search itineraries through the configured travel provider.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "origin": { "type": "string" },
+          "destination": { "type": "string" },
+          "date": { "type": "string" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "search_itineraries"
+    },
+    {
+      "tool_name": "flights_get_price",
+      "description": "Retrieve the current price of an itinerary.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "itinerary_id": { "type": "string" }
+        },
+        "required": ["itinerary_id"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "get_price"
+    },
+    {
+      "tool_name": "flights_monitor_price",
+      "description": "Record a price condition for recurring evaluation by the scheduler.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "condition": { "type": "string", "description": "For example: 'price < 1000 BRL'" }
+        },
+        "required": ["condition"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "monitor_price"
+    },
+    {
+      "tool_name": "flights_prepare_booking",
+      "description": "Validate passenger details and prepare a booking for approval. Never completes a purchase.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "passengers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "full_name": { "type": "string" },
+                "document": { "type": "string" }
+              }
+            }
+          }
+        },
+        "required": ["passengers"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "prepare_booking"
+    },
+    {
+      "tool_name": "flights_complete_purchase",
+      "description": "Complete a purchase after approval. Critical risk: always requires explicit approval bound to the exact itinerary and price.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "itinerary_id": { "type": "string" },
+          "price": { "type": "number" },
+          "currency": { "type": "string" }
+        },
+        "required": ["itinerary_id", "price"]
+      },
+      "risk_class": "critical",
+      "implementation_type": "declarative",
+      "implementation_ref": "complete_purchase"
+    }
+  ]
+}

@@ -83,6 +83,11 @@ pub async fn setup(
     .execute(&state.db)
     .await?;
 
+    // The system creates the default agent so the user can chat immediately
+    // without manual configuration (spec part1 section 1: usable right after
+    // deployment).
+    create_default_agent(&state, &id, &now).await;
+
     Ok((
         StatusCode::CREATED,
         Json(UserResponse {
@@ -93,6 +98,32 @@ pub async fn setup(
             created_at: now,
         }),
     ))
+}
+
+/// Ensure the user has a default agent. Called after setup and on login;
+/// the system owns agent creation so the user never has to do it manually.
+pub async fn create_default_agent(state: &AppState, user_id: &str, now: &str) {
+    let existing: i64 = sqlx::query("SELECT COUNT(*) AS count FROM agents WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .map(|r| r.get("count"))
+        .unwrap_or(1);
+    if existing > 0 {
+        return;
+    }
+    sqlx::query(
+        "INSERT INTO agents (id, user_id, name, instructions, status, settings_json, created_at, updated_at)
+         VALUES (?, ?, 'Assistant', 'You are a helpful personal assistant. Answer questions directly and concisely. When the user asks for recurring work, help them define it; only create tasks when they explicitly request one.', 'active', '{}', ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| tracing::error!(error = %e, "failed to create default agent"))
+    .ok();
 }
 
 fn validate_credentials(email: &str, password: &str) -> ApiResult<()> {

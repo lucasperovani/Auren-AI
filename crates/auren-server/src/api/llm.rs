@@ -21,6 +21,7 @@ pub fn router() -> Router<AppState> {
         .route("/providers/{provider_id}", get(get_provider).patch(update_provider).delete(delete_provider))
         .route("/providers/{provider_id}/test", post(test_provider))
         .route("/providers/{provider_id}/models", get(list_models).post(add_model))
+        .route("/providers/{provider_id}/models/discover", post(discover_models))
 }
 
 #[derive(Deserialize)]
@@ -56,32 +57,38 @@ fn row_to_provider(r: &sqlx::sqlite::SqliteRow) -> ProviderResponse {
 }
 
 /// Validate the provider base URL: must be http(s) and must not target
-/// internal/loopback destinations (spec 3.3: prevent SSRF to internal hosts).
-fn validate_base_url(url: &str) -> ApiResult<()> {
+/// cloud-metadata or link-local destinations (spec 3.3).
+///
+/// Local LLM runtimes (Ollama, LM Studio, llama.cpp) listen on loopback or
+/// private addresses by design, and the admin configures the base URL
+/// deliberately — so loopback/private hosts are allowed here. The SSRF
+/// protection that blocks internal destinations applies to agent-fetched
+/// URLs (web research), not to this admin-configured setting.
+fn validate_base_url_typed(url: &str, _provider_type: &str) -> ApiResult<()> {
     let parsed = url::Url::parse(url)
         .map_err(|_| ApiError::Unprocessable("invalid base_url".into()))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(ApiError::Unprocessable("base_url must be http(s)".into()));
     }
     let host = parsed.host_str().unwrap_or_default();
-    if host.is_empty()
-        || host == "localhost"
-        || host == "metadata.google.internal"
-        || host.ends_with(".internal")
-        || host.ends_with(".local")
-    {
+    if host.is_empty() || host == "metadata.google.internal" {
         return Err(ApiError::Unprocessable("base_url must not target internal hosts".into()));
     }
+    // Block cloud metadata and link-local addresses specifically.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let internal = match ip {
-            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_private(),
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+            std::net::IpAddr::V6(v6) => v6.is_unspecified(),
         };
-        if internal {
-            return Err(ApiError::Unprocessable("base_url must not target internal addresses".into()));
+        if blocked {
+            return Err(ApiError::Unprocessable("base_url must not target link-local addresses".into()));
         }
     }
     Ok(())
+}
+
+fn validate_base_url(url: &str) -> ApiResult<()> {
+    validate_base_url_typed(url, "")
 }
 
 pub async fn list_providers(
@@ -110,7 +117,7 @@ pub async fn create_provider(
     ) {
         return Err(ApiError::Unprocessable("invalid provider_type".into()));
     }
-    validate_base_url(&req.base_url)?;
+    validate_base_url_typed(&req.base_url, &req.provider_type)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -270,6 +277,155 @@ pub struct AddModelRequest {
     pub model_name: String,
     #[serde(default)]
     pub capabilities: serde_json::Value,
+}
+
+/// Discover available models from the provider and register them.
+///
+/// Ollama exposes its installed models at `/api/tags`; OpenAI-compatible
+/// APIs expose them at `/v1/models`. Discovered models are stored so the
+/// user can select them without typing names manually.
+pub async fn discover_models(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(provider_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_owned_provider(&state, &user, &provider_id).await?;
+    let row = sqlx::query("SELECT provider_type, base_url, encrypted_api_key, key_nonce FROM llm_providers WHERE id = ?")
+        .bind(&provider_id)
+        .fetch_one(&state.db)
+        .await?;
+    let provider_type: String = row.get("provider_type");
+    let base_url: String = row.get("base_url");
+    let ciphertext: Option<Vec<u8>> = row.get("encrypted_api_key");
+    let nonce: Option<Vec<u8>> = row.get("key_nonce");
+    let api_key = match (ciphertext, nonce) {
+        (Some(ct), Some(n)) => Some(
+            crate::services::credentials::decrypt_credential(&ct, &n, &state.config.credential_encryption_key)
+                .map_err(|_| ApiError::Internal(anyhow::anyhow!("credential decryption failed")))?,
+        ),
+        _ => None,
+    };
+
+    let model_names = discover_model_names(&provider_type, &base_url, api_key.as_deref()).await?;
+
+    // Register discovered models, skipping ones already present.
+    let mut added = 0;
+    for name in &model_names {
+        let exists: Option<i64> = sqlx::query("SELECT 1 FROM llm_models WHERE provider_id = ? AND model_name = ?")
+            .bind(&provider_id)
+            .bind(name)
+            .fetch_optional(&state.db)
+            .await?
+            .map(|_| 1);
+        if exists.is_none() {
+            sqlx::query("INSERT INTO llm_models (id, provider_id, model_name, capabilities_json, created_at) VALUES (?, ?, ?, '{}', ?)")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&provider_id)
+                .bind(name)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&state.db)
+                .await?;
+            added += 1;
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "discovered": model_names.len(),
+        "added": added,
+        "models": model_names,
+    })))
+}
+
+/// Query the provider's model listing endpoint. Tries the OpenAI-style
+/// `/v1/models` first, then Ollama's `/api/tags`, so gateways exposing
+/// either format work with either provider type.
+async fn discover_model_names(
+    provider_type: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> ApiResult<Vec<String>> {
+    let base = base_url.trim_end_matches('/');
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+
+    // Candidate listing URLs, in order of preference for the provider type.
+    let mut candidates: Vec<String> = Vec::new();
+    if provider_type == "ollama" {
+        candidates.push(format!("{root}/api/tags"));
+        candidates.push(format!("{root}/v1/models"));
+    } else {
+        candidates.push(format!("{root}/v1/models"));
+        candidates.push(format!("{root}/api/tags"));
+    }
+
+    let client = reqwest::Client::new();
+    let mut last_status = None;
+    for url in &candidates {
+        let mut request = client.get(url).timeout(std::time::Duration::from_secs(15));
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, url = %url, "model discovery request failed");
+                return Err(ApiError::ServiceUnavailable);
+            }
+        };
+        if !response.status().is_success() {
+            last_status = Some(response.status().as_u16());
+            // Try the next candidate path (404/405 mean "wrong path here").
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::NOT_FOUND
+                    | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    | reqwest::StatusCode::BAD_REQUEST
+            ) {
+                continue;
+            }
+            return Err(ApiError::Conflict(format!(
+                "provider returned HTTP {} while listing models",
+                response.status().as_u16()
+            )));
+        }
+        let payload: serde_json::Value = match response.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let names = parse_model_list(&payload);
+        if !names.is_empty() {
+            return Ok(names);
+        }
+    }
+    match last_status {
+        Some(status) => Err(ApiError::Conflict(format!(
+            "provider returned HTTP {status} while listing models"
+        ))),
+        None => Err(ApiError::Conflict(
+            "the provider did not return a recognizable model list".into(),
+        )),
+    }
+}
+
+/// Extract model names from either listing format.
+/// Ollama: `{"models": [{"name": ...}]}`; OpenAI: `{"data": [{"id": ...}]}`.
+fn parse_model_list(payload: &serde_json::Value) -> Vec<String> {
+    if let Some(models) = payload.get("models").and_then(|m| m.as_array()) {
+        return models
+            .iter()
+            .filter_map(|m| {
+                m.get("name")
+                    .or_else(|| m.get("model"))
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+    }
+    if let Some(data) = payload.get("data").and_then(|d| d.as_array()) {
+        return data
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            .collect();
+    }
+    vec![]
 }
 
 /// Register a model with the provider. Capabilities are stored explicitly

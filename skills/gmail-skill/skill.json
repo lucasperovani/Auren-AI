@@ -1,0 +1,75 @@
+{
+  "schema_version": "1",
+  "id": "gmail-skill",
+  "name": "Gmail",
+  "version": "1.0.0",
+  "description": "Search, read, and draft Gmail messages through a connected Google account. Sending requires approval by default.",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": ["gmail"],
+  "required_permissions": ["gmail.read", "gmail.send"],
+  "tools": [
+    {
+      "tool_name": "gmail_search_messages",
+      "description": "Search the connected Gmail account's messages. Returns message identifiers and metadata.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Gmail search query (same syntax as the Gmail search box)" },
+          "max_results": { "type": "integer", "description": "Maximum number of results (default 10)" }
+        },
+        "required": ["query"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "search_messages"
+    },
+    {
+      "tool_name": "gmail_read_message",
+      "description": "Read a message's metadata and snippet by identifier.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "message_id": { "type": "string" }
+        },
+        "required": ["message_id"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "read_message"
+    },
+    {
+      "tool_name": "gmail_create_draft",
+      "description": "Create a draft message without sending it.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string" },
+          "subject": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "required": ["to"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "create_draft"
+    },
+    {
+      "tool_name": "gmail_send_message",
+      "description": "Send an email message. Requires explicit approval by default.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string" },
+          "subject": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "required": ["to", "subject", "body"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "send_message"
+    }
+  ]
+}

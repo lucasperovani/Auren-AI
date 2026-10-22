@@ -56,14 +56,16 @@ pub async fn list_conversations(
 ) -> ApiResult<Json<serde_json::Value>> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let cursor = params.cursor.as_deref().and_then(pagination::decode_cursor);
+    // Most recently updated first: the chat sidebar shows the current
+    // conversation at the top.
     let rows = match &cursor {
         Some(c) => {
-            sqlx::query("SELECT * FROM conversations WHERE user_id = ? AND id > ? ORDER BY id LIMIT ?")
+            sqlx::query("SELECT * FROM conversations WHERE user_id = ? AND updated_at < ? ORDER BY updated_at DESC LIMIT ?")
                 .bind(&user.id).bind(c).bind(limit + 1)
                 .fetch_all(&state.db).await?
         }
         None => {
-            sqlx::query("SELECT * FROM conversations WHERE user_id = ? ORDER BY id LIMIT ?")
+            sqlx::query("SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?")
                 .bind(&user.id).bind(limit + 1)
                 .fetch_all(&state.db).await?
         }
@@ -71,7 +73,7 @@ pub async fn list_conversations(
     let has_more = rows.len() as i64 > limit;
     let items: Vec<ConversationResponse> = rows.iter().take(limit as usize).map(row_to_conversation).collect();
     let next_cursor = if has_more {
-        items.last().map(|c| pagination::encode_cursor(&c.id))
+        items.last().map(|c| pagination::encode_cursor(&c.updated_at))
     } else {
         None
     };
@@ -236,9 +238,12 @@ pub struct PostMessageRequest {
     pub content: String,
 }
 
-/// Submit a user message. Processing is asynchronous: the message is
-/// persisted immediately and `202 Accepted` returns an operation identifier
-/// the frontend can follow (spec 3.5).
+/// Submit a user message and get the assistant's reply.
+///
+/// The message is persisted, sent to the agent's LLM with the conversation
+/// history, and the assistant's response is persisted and returned. Chat
+/// never creates tasks on its own — tasks are created only when the user
+/// (or the agent, at the user's request) explicitly registers one.
 pub async fn post_message(
     State(state): State<AppState>,
     user: AuthUser,
@@ -249,10 +254,12 @@ pub async fn post_message(
     if req.content.trim().is_empty() {
         return Err(ApiError::Unprocessable("content is required".into()));
     }
-    let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
+
+    // Persist the user message.
+    let user_message_id = uuid::Uuid::new_v4().to_string();
     sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)")
-        .bind(&id)
+        .bind(&user_message_id)
         .bind(&conversation_id)
         .bind(req.content.trim())
         .bind(&now)
@@ -264,10 +271,55 @@ pub async fn post_message(
         .execute(&state.db)
         .await?;
 
-    // The agent runtime processes the message asynchronously; the operation
-    // identifier lets the frontend follow progress via the WebSocket channel.
+    // Resolve the conversation's agent and its LLM configuration.
+    let agent_id: String = sqlx::query("SELECT agent_id FROM conversations WHERE id = ?")
+        .bind(&conversation_id)
+        .fetch_one(&state.db)
+        .await?
+        .get("agent_id");
+
+    let runtime = crate::services::agent_runtime::AgentRuntime::new(state.clone());
+    let reply = match runtime.chat(&agent_id, &conversation_id, req.content.trim()).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            // Honest failure: the user sees why the agent could not answer.
+            let error_text = format!("The agent could not respond: {e}");
+            let error_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
+                .bind(&error_id)
+                .bind(&conversation_id)
+                .bind(&error_text)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&state.db)
+                .await?;
+            return Ok((
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": error_id,
+                    "reply": error_text,
+                    "error": true,
+                })),
+            ));
+        }
+    };
+
+    // Persist the assistant reply.
+    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
+        .bind(&assistant_message_id)
+        .bind(&conversation_id)
+        .bind(&reply)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.db)
+        .await?;
+
     Ok((
-        axum::http::StatusCode::ACCEPTED,
-        Json(json!({ "message_id": id, "operation_id": id, "status": "accepted" })),
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "reply": reply,
+        })),
     ))
 }

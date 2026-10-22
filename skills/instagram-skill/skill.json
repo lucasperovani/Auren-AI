@@ -1,0 +1,45 @@
+{
+  "schema_version": "1",
+  "id": "instagram-skill",
+  "name": "Instagram",
+  "version": "1.0.0",
+  "description": "Account information and media listing through the official Instagram Graph API. Publishing requires approval by default.",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": ["instagram"],
+  "required_permissions": ["instagram.read", "instagram.publish"],
+  "tools": [
+    {
+      "tool_name": "instagram_get_account_info",
+      "description": "Retrieve the connected account's basic information.",
+      "input_schema": { "type": "object" },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "get_account_info"
+    },
+    {
+      "tool_name": "instagram_list_media",
+      "description": "List the account's recent media.",
+      "input_schema": { "type": "object" },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "list_media"
+    },
+    {
+      "tool_name": "instagram_publish_media",
+      "description": "Publish an image with a caption. Requires explicit approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "image_url": { "type": "string", "description": "Publicly reachable image URL" },
+          "caption": { "type": "string" }
+        },
+        "required": ["image_url"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "publish_media"
+    }
+  ]
+}

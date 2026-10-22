@@ -212,7 +212,7 @@ impl AgentRuntime {
 
     async fn build_provider(&self, agent_id: &str) -> Option<Box<dyn LlmProvider>> {
         let row = sqlx::query(
-            "SELECT p.provider_type, p.base_url, p.encrypted_api_key, m.model_name
+            "SELECT p.provider_type, p.base_url, p.encrypted_api_key, p.key_nonce, m.model_name
              FROM agents a
              LEFT JOIN llm_providers p ON p.id = a.llm_provider_id
              LEFT JOIN llm_models m ON m.id = a.model_id
@@ -230,11 +230,18 @@ impl AgentRuntime {
         let ciphertext: Option<Vec<u8>> = row.try_get("encrypted_api_key").ok();
         let nonce: Option<Vec<u8>> = row.try_get("key_nonce").ok();
         // Decrypt the stored key; the plaintext never leaves this scope.
+        // A ciphertext without a valid 12-byte nonce (legacy/inserted rows)
+        // is treated as absent rather than panicking.
         let api_key = match (ciphertext, nonce) {
-            (Some(ct), Some(n)) => Some(
-                crate::services::credentials::decrypt_credential(&ct, &n, &self.state.config.credential_encryption_key)
-                    .ok()?,
-            ),
+            (Some(ct), Some(n)) if n.len() == 12 => {
+                match crate::services::credentials::decrypt_credential(&ct, &n, &self.state.config.credential_encryption_key) {
+                    Ok(key) => Some(key),
+                    // Undecryptable credentials (wrong key/tampered) make the
+                    // provider unusable; surface as "not configured" honestly.
+                    Err(_) => return None,
+                }
+            }
+            // No stored key: local providers (Ollama) work without one.
             _ => None,
         };
 
@@ -295,5 +302,149 @@ impl AgentRuntime {
             .execute(&self.state.db)
             .await
             .ok();
+    }
+
+    /// Answer a chat message with the conversation history. Chat is a pure
+    /// LLM interaction: it never creates tasks or invokes tools on its own.
+    /// Tasks are created only when explicitly requested and confirmed.
+    pub async fn chat(&self, agent_id: &str, conversation_id: &str, _user_message: &str) -> Result<String, String> {
+        let provider = self
+            .build_provider(agent_id)
+            .await
+            .ok_or_else(|| "no LLM provider configured for this agent. Add one in Settings, then select it for the agent.".to_string())?;
+
+        // Load the agent's instructions.
+        let instructions: String = sqlx::query("SELECT instructions FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_optional(&self.state.db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_get("instructions").ok())
+            .unwrap_or_default();
+
+        // Build the message list from the conversation history (last 40
+        // messages) plus the new user message.
+        let history = sqlx::query(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 40",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.state.db)
+        .await
+        .unwrap_or_default();
+
+        let mut messages = vec![LlmMessage {
+            role: "system".into(),
+            content: format!(
+                "{instructions}\n\nYou are a personal assistant in a chat conversation. \
+                 Answer the user's questions directly. You may use the available tools when \
+                 they help answer (reading workspace files, web research, connected \
+                 integrations). Do not create tasks unless the user explicitly asks you to \
+                 schedule or automate something; in that case, describe what you would set \
+                 up and ask for confirmation first."
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        // History is newest-first; reverse to chronological order.
+        for row in history.iter().rev() {
+            let role: String = row.get("role");
+            let content: String = row.get("content");
+            if role == "user" || role == "assistant" {
+                messages.push(LlmMessage {
+                    role,
+                    content,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+
+        // Chat can invoke the agent's authorized tools (bounded loop).
+        let available_tools = self.available_tools(agent_id).await;
+        let mut tool_calls_made: u32 = 0;
+
+        for _iteration in 0..8 {
+            let completion = provider
+                .complete(&messages, &available_tools, None)
+                .await
+                .map_err(|e| format!("LLM request failed: {e}"))?;
+
+            if completion.tool_calls.is_empty() {
+                if completion.content.trim().is_empty() {
+                    return Err("the model returned an empty response".into());
+                }
+                return Ok(completion.content);
+            }
+
+            messages.push(LlmMessage {
+                role: "assistant".into(),
+                content: completion.content.clone(),
+                tool_calls: Some(completion.tool_calls.clone()),
+                tool_call_id: None,
+            });
+
+            for call in &completion.tool_calls {
+                if tool_calls_made >= 10 {
+                    return Ok(completion.content);
+                }
+                tool_calls_made += 1;
+
+                let tool_id = self.resolve_tool(agent_id, &call.name).await;
+                let Some(tool_id) = tool_id else {
+                    messages.push(LlmMessage {
+                        role: "tool".into(),
+                        content: format!("tool '{}' is not available to this agent", call.name),
+                        tool_calls: None,
+                        tool_call_id: Some(call.id.clone()),
+                    });
+                    continue;
+                };
+
+                match self.tools.authorize(agent_id, &tool_id, &call.arguments, None).await {
+                    Ok(Authorization::Allowed) => {
+                        let result = self.tools.invoke_chat(agent_id, &tool_id, &call.arguments).await;
+                        if let Err(e) = &result {
+                            tracing::warn!(tool = %call.name, error = %e, args = %call.arguments, "chat tool invocation failed");
+                        }
+                        let content = match result {
+                            Ok(value) => value.to_string(),
+                            Err(e) => format!("tool error: {e}"),
+                        };
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content,
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                    Ok(Authorization::RequiresApproval { .. }) => {
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content: "this operation requires user approval; tell the user to approve it in the Approvals view, then try again".into(),
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                    Ok(Authorization::Denied(reason)) => {
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content: format!("denied: {reason}"),
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                    Err(e) => {
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content: format!("authorization error: {e}"),
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        Err("the assistant used too many tool calls without reaching an answer".into())
     }
 }

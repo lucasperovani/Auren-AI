@@ -32,8 +32,11 @@ pub fn router() -> Router<AppState> {
 /// Available integration provider types (spec 3.9: the capability list must
 /// reflect implemented operations, not theoretical provider APIs).
 const CATALOG: &[(&str, &[&str])] = &[
-    ("gmail", &["search_messages", "read_message", "send_message"]),
-    ("gcal", &["list_events", "create_event"]),
+    ("gmail", &["search_messages", "read_message", "create_draft", "send_message"]),
+    ("gcal", &["list_events", "search_events", "create_event", "update_event", "cancel_event"]),
+    ("gphotos", &["list_albums", "search_media", "get_media"]),
+    ("instagram", &["get_account_info", "list_media", "publish_media"]),
+    ("flights", &["search_itineraries", "get_price", "monitor_price", "prepare_booking", "complete_purchase"]),
 ];
 
 pub async fn catalog() -> Json<serde_json::Value> {
@@ -88,6 +91,18 @@ pub async fn connect(
         return Err(ApiError::Unprocessable(format!("unsupported provider type '{provider_type}'")));
     }
 
+    // Google providers use a real OAuth flow when the OAuth client is
+    // configured (GOOGLE_CLIENT_ID/SECRET in the environment). Without it,
+    // the user can still connect manually with an access token.
+    if matches!(provider_type.as_str(), "gmail" | "gcal" | "gphotos") {
+        if let Some(auth_url) = crate::services::google_oauth::authorization_url(&state, &user.id, &provider_type).await? {
+            return Ok((
+                axum::http::StatusCode::OK,
+                Json(json!({ "oauth_url": auth_url, "flow": "oauth" })),
+            ));
+        }
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -103,8 +118,34 @@ pub async fn connect(
     .execute(&state.db)
     .await?;
 
-    // OAuth flows would return an authorization URL with a signed state
-    // parameter here; direct providers connect immediately.
+    // Direct providers store the supplied credentials encrypted.
+    if let Some(token) = req.credentials.get("access_token").and_then(|v| v.as_str()) {
+        let account_id = uuid::Uuid::new_v4().to_string();
+        let (ct, nonce) = crate::services::credentials::encrypt_credential(token, &state.config.credential_encryption_key)?;
+        sqlx::query(
+            "INSERT INTO integration_accounts (id, integration_id, external_account_id, display_name, granted_scopes_json, status, created_at, updated_at)
+             VALUES (?, ?, 'manual', ?, '[]', 'active', ?, ?)",
+        )
+        .bind(&account_id)
+        .bind(&id)
+        .bind(req.display_name.trim())
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO encrypted_credentials (id, integration_account_id, ciphertext, nonce, key_version, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&account_id)
+        .bind(ct)
+        .bind(nonce)
+        .bind(&now)
+        .execute(&state.db)
+        .await?;
+    }
+
     Ok((
         axum::http::StatusCode::CREATED,
         Json(json!({ "integration_id": id, "status": "connected" })),
@@ -112,7 +153,8 @@ pub async fn connect(
 }
 
 /// Process the OAuth callback. The `state` parameter is validated against
-/// the original authorization request before any token exchange.
+/// the original authorization request before any token exchange; the code
+/// is exchanged for tokens with PKCE and stored encrypted.
 pub async fn oauth_callback(
     State(state): State<AppState>,
     user: AuthUser,
@@ -123,7 +165,8 @@ pub async fn oauth_callback(
         .get("state")
         .ok_or_else(|| ApiError::BadRequest("missing state".into()))?;
 
-    // Validate the state parameter: it must be a known, unexpired flow.
+    // Validate the state parameter: it must be a known, unexpired flow
+    // belonging to this user.
     let flow = sqlx::query("SELECT value_json FROM app_settings WHERE key = ?")
         .bind(format!("oauth_state:{oauth_state}"))
         .fetch_optional(&state.db)
@@ -134,16 +177,14 @@ pub async fn oauth_callback(
     if flow["user_id"].as_str() != Some(user.id.as_str()) {
         return Err(ApiError::Forbidden("state does not belong to this user".into()));
     }
-    // Single use: consume the state.
-    sqlx::query("DELETE FROM app_settings WHERE key = ?")
-        .bind(format!("oauth_state:{oauth_state}"))
-        .execute(&state.db)
-        .await?;
 
-    // A real implementation would exchange `code` for tokens here and store
-    // them as encrypted credentials. The callback acknowledges the flow.
-    let _ = code;
-    Ok(Json(json!({ "status": "connected" })))
+    // Exchange the code for tokens (consumes the state; stores encrypted).
+    let (integration_id, account_id) = crate::services::google_oauth::exchange_code(&state, oauth_state, code).await?;
+    Ok(Json(json!({
+        "status": "connected",
+        "integration_id": integration_id,
+        "account_id": account_id,
+    })))
 }
 
 async fn require_owned_integration(state: &AppState, user: &AuthUser, integration_id: &str) -> ApiResult<()> {

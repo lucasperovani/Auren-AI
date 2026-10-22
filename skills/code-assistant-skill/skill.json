@@ -1,0 +1,88 @@
+{
+  "schema_version": "1",
+  "id": "code-assistant-skill",
+  "name": "Code Assistant",
+  "version": "1.0.0",
+  "description": "Read, create, and edit code files in the workspace, Copilot-style. The agent can explore the code tree, search code, and make surgical edits. Nothing is executed automatically.",
+  "entrypoint": "tools/",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "required_integrations": [],
+  "required_permissions": ["workspace.read", "workspace.write"],
+  "tools": [
+    {
+      "tool_name": "code_list_dir",
+      "description": "List the workspace code tree (bounded depth) to explore the project structure.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Optional subdirectory; empty for the workspace root" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "code_list_dir"
+    },
+    {
+      "tool_name": "code_read_file",
+      "description": "Read a code file with line numbers, optionally a line range.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "start_line": { "type": "integer" },
+          "end_line": { "type": "integer" }
+        },
+        "required": ["path"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "code_read_file"
+    },
+    {
+      "tool_name": "code_search",
+      "description": "Search code across the workspace for a text query.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" }
+        },
+        "required": ["query"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "code_search"
+    },
+    {
+      "tool_name": "code_write_file",
+      "description": "Create or overwrite a code file.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["path", "content"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "code_write_file"
+    },
+    {
+      "tool_name": "code_edit_block",
+      "description": "Surgical edit: replace an exact, unique text block with new content. Read the file first and copy the exact text to replace.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "old_text": { "type": "string", "description": "Exact text to replace; must match exactly one location" },
+          "new_text": { "type": "string" }
+        },
+        "required": ["path", "old_text", "new_text"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "code_edit_block"
+    }
+  ]
+}

@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,11 +22,57 @@ pub struct LlmMessage {
 }
 
 /// A tool invocation requested by the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// On the wire (OpenAI format), `arguments` is a JSON-encoded *string*;
+/// internally we keep the parsed value. The custom serialization handles
+/// both directions.
+#[derive(Debug, Clone)]
 pub struct LlmToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+}
+
+impl Serialize for LlmToolCall {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("LlmToolCall", 3)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("type", "function")?;
+        state.serialize_field("function", &json!({
+            "name": self.name,
+            "arguments": serde_json::to_string(&self.arguments).unwrap_or_else(|_| "{}".into()),
+        }))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LlmToolCall {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            id: String,
+            #[serde(default)]
+            function: Option<Value>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            arguments: Option<Value>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let function = wire.function.unwrap_or(json!({}));
+        let name = wire
+            .name
+            .or_else(|| function.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default();
+        // Arguments arrive as a JSON string; parse them into a value.
+        let arguments = match function.get("arguments").or(wire.arguments.as_ref()) {
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(json!({})),
+            Some(other) => other.clone(),
+            None => json!({}),
+        };
+        Ok(LlmToolCall { id: wire.id, name, arguments })
+    }
 }
 
 /// A tool definition exposed to the model.
@@ -104,14 +150,14 @@ pub fn build_provider(
     model: &str,
 ) -> Result<Box<dyn LlmProvider>, LlmError> {
     match provider_type {
-        "openai_compatible" | "openai" => Ok(Box::new(providers::OpenAiCompatibleProvider::new(
-            base_url, api_key, model,
-        ))),
-        "ollama" => Ok(Box::new(providers::OpenAiCompatibleProvider::new(
-            &format!("{base_url}/v1"),
-            None,
-            model,
-        ))),
+        "openai_compatible" | "openai" | "ollama" => {
+            // Ollama gateways may require an API key too; the key is passed
+            // through when one is configured. The base URL is normalized
+            // (append /v1 when missing) inside the provider.
+            Ok(Box::new(providers::OpenAiCompatibleProvider::new(
+                base_url, api_key, model,
+            )))
+        }
         "anthropic" | "gemini" => {
             // Gemini and Anthropic use different wire formats; both are
             // reachable through their OpenAI-compatible endpoints where
@@ -142,11 +188,23 @@ pub mod providers {
     impl OpenAiCompatibleProvider {
         pub fn new(base_url: &str, api_key: Option<&str>, model: &str) -> Self {
             Self {
-                base_url: base_url.trim_end_matches('/').to_string(),
+                base_url: normalize_base_url(base_url),
                 api_key: api_key.map(|k| k.to_string()),
                 model: model.to_string(),
                 client: reqwest::Client::new(),
             }
+        }
+    }
+
+    /// Normalize an OpenAI-compatible base URL so that both
+    /// `https://host` and `https://host/v1` work: the chat endpoint is
+    /// always `{base}/chat/completions` with `base` ending in `/v1`.
+    pub fn normalize_base_url(base_url: &str) -> String {
+        let base = base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            base.to_string()
+        } else {
+            format!("{base}/v1")
         }
     }
 
@@ -209,16 +267,15 @@ pub mod providers {
                 }
             })?;
 
-            match response.status() {
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                    return Err(LlmError::AuthenticationFailed)
-                }
-                reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(LlmError::RateLimited),
-                status if !status.is_success() => {
-                    tracing::debug!(status = status.as_u16(), "llm provider error");
-                    return Err(LlmError::RequestFailed);
-                }
-                _ => {}
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                tracing::warn!(status = status.as_u16(), body = %body, "llm provider error");
+                return Err(match status {
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => LlmError::AuthenticationFailed,
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => LlmError::RateLimited,
+                    _ => LlmError::RequestFailed,
+                });
             }
 
             let body_bytes = response.bytes().await.map_err(|_| LlmError::RequestFailed)?;

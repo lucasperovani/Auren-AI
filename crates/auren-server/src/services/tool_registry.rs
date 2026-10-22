@@ -202,17 +202,75 @@ impl ToolRegistry {
         output
     }
 
+    /// Invoke a tool during a chat conversation. No task run exists, so the
+    /// call is audited but not recorded as a task step.
+    pub async fn invoke_chat(
+        &self,
+        _agent_id: &str,
+        skill_tool_id: &str,
+        args: &Value,
+    ) -> Result<Value, ApiError> {
+        let account_id = args.get("integration_account_id").and_then(|v| v.as_str());
+        self.execute_declarative_with_account(skill_tool_id, args, account_id).await
+    }
+
     /// Resolve and run the builtin implementation behind a declarative tool.
     async fn execute_declarative(&self, skill_tool_id: &str, args: &Value) -> Result<Value, ApiError> {
-        let row = sqlx::query("SELECT implementation_ref FROM skill_tools WHERE id = ?")
-            .bind(skill_tool_id)
-            .fetch_optional(&self.db)
-            .await?
-            .ok_or(ApiError::NotFound)?;
+        let account_id = args.get("integration_account_id").and_then(|v| v.as_str());
+        self.execute_declarative_with_account(skill_tool_id, args, account_id).await
+    }
+
+    /// Resolve and run the implementation, with an explicit account override
+    /// (used by chat invocations where the account comes from the arguments).
+    async fn execute_declarative_with_account(
+        &self,
+        skill_tool_id: &str,
+        args: &Value,
+        account_id: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let row = sqlx::query(
+            "SELECT st.implementation_ref, sv.skill_id, sk.id AS skill_row_id
+             FROM skill_tools st
+             JOIN skill_versions sv ON sv.id = st.skill_version_id
+             JOIN skills sk ON sk.id = sv.skill_id
+             WHERE st.id = ?",
+        )
+        .bind(skill_tool_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
         let reference: Option<String> = row.get("implementation_ref");
+        // Normalize the bare form ("code_write_file") to the namespaced
+        // builtin form ("builtin.code_write_file") when applicable.
+        let reference = reference.map(|r| {
+            if r.starts_with("builtin.") {
+                r
+            } else {
+                format!("builtin.{r}")
+            }
+        });
         let reference = reference.ok_or_else(|| {
             ApiError::Unprocessable("declarative tool has no implementation reference".into())
         })?;
+
+        // Integration tools dispatch to the integration modules; they need
+        // the connected account passed in the arguments.
+        if let Some(account_id) = account_id {
+            let provider_type: String = sqlx::query("SELECT provider_type FROM integrations WHERE id = (SELECT integration_id FROM integration_accounts WHERE id = ?)")
+                .bind(account_id)
+                .fetch_optional(&self.db)
+                .await?
+                .ok_or(ApiError::NotFound)?
+                .try_get("provider_type")?;
+            return super::integrations::execute_integration_tool(
+                &self.state,
+                &provider_type,
+                &reference,
+                args,
+                account_id,
+            )
+            .await;
+        }
 
         super::builtins::execute_builtin(&self.state, &reference, args).await
     }

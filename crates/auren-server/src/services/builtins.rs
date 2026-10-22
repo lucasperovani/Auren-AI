@@ -24,6 +24,12 @@ pub async fn execute_builtin(
         "builtin.file_delete" => file_delete(state, args).await,
         "builtin.file_search" => file_search(state, args).await,
         "builtin.web_fetch" => web_fetch(state, args).await,
+        // Code editing tools (Copilot-style, operating on the workspace).
+        "builtin.code_read_file" => code_read_file(state, args).await,
+        "builtin.code_write_file" => code_write_file(state, args).await,
+        "builtin.code_edit_block" => code_edit_block(state, args).await,
+        "builtin.code_list_dir" => code_list_dir(state, args).await,
+        "builtin.code_search" => code_search(state, args).await,
         other => Err(ApiError::Unprocessable(format!("unknown builtin '{other}'"))),
     }
 }
@@ -44,9 +50,29 @@ fn resolve_workspace_path(state: &AppState, path: &str) -> Result<std::path::Pat
             return Err(ApiError::Forbidden("path traversal is not allowed".into()));
         }
     }
+    // The root must exist (created at startup); canonicalize it once so the
+    // containment check works for files that do not exist yet.
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("workspace root unavailable: {e}")))?;
     let resolved = root.join(relative);
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-    let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+    // Canonicalize the deepest existing ancestor and append the remainder:
+    // this resolves symlinks where present while supporting new files.
+    let mut existing = resolved.clone();
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => {
+                suffix.push(existing.file_name().map(|n| n.to_os_string()).unwrap_or_default());
+                existing = parent.to_path_buf();
+            }
+            None => break,
+        }
+    }
+    let mut canonical = existing.canonicalize().unwrap_or_else(|_| existing.clone());
+    for part in suffix.iter().rev() {
+        canonical = canonical.join(part);
+    }
     if !canonical.starts_with(&canonical_root) {
         return Err(ApiError::Forbidden("path is outside the authorized workspace".into()));
     }
@@ -193,6 +219,141 @@ pub fn validate_public_url(url: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Code editing tools (Copilot-style, operating on the workspace).
+// These give the agent the ability to read, create, and surgically edit
+// code files in the workspace. Nothing is executed automatically (spec
+// part1 section 4: code execution is a separately permissioned capability).
+// ---------------------------------------------------------------------------
+
+/// Read a code file with line numbers, optionally a line range.
+async fn code_read_file(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("path is required".into()))?;
+    let resolved = resolve_workspace_path(state, path)?;
+    let content = std::fs::read_to_string(&resolved).map_err(|_| ApiError::NotFound)?;
+    let start = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+    let end = args.get("end_line").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(usize::MAX);
+    let lines: Vec<String> = content
+        .lines()
+        .enumerate()
+        .skip(start - 1)
+        .take(end.saturating_sub(start - 1))
+        .map(|(i, l)| format!("{:>4} | {}", i + 1, l))
+        .collect();
+    Ok(json!({
+        "path": path,
+        "total_lines": content.lines().count(),
+        "content": lines.join("\n"),
+    }))
+}
+
+/// Create or overwrite a code file.
+async fn code_write_file(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("path is required".into()))?;
+    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+    let resolved = resolve_workspace_path(state, path)?;
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+    }
+    std::fs::write(&resolved, content).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+    Ok(json!({ "path": path, "lines_written": content.lines().count() }))
+}
+
+/// Surgical edit: replace an exact text block with new content (Copilot-style
+/// find/replace). The `old_text` must match exactly and uniquely; ambiguous
+/// matches are rejected so the agent never edits the wrong place.
+async fn code_edit_block(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("path is required".into()))?;
+    let old_text = args.get("old_text").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("old_text is required".into()))?;
+    let new_text = args.get("new_text").and_then(|v| v.as_str()).unwrap_or_default();
+
+    let resolved = resolve_workspace_path(state, path)?;
+    let content = std::fs::read_to_string(&resolved).map_err(|_| ApiError::NotFound)?;
+
+    let occurrences = content.matches(old_text).count();
+    if occurrences == 0 {
+        return Err(ApiError::Unprocessable(
+            "old_text not found in the file; read the file first and copy the exact text".into(),
+        ));
+    }
+    if occurrences > 1 {
+        return Err(ApiError::Unprocessable(format!(
+            "old_text matches {occurrences} locations; include more surrounding lines to make it unique"
+        )));
+    }
+    let updated = content.replacen(old_text, new_text, 1);
+    std::fs::write(&resolved, &updated).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+    Ok(json!({ "path": path, "edited": true }))
+}
+
+/// List a directory tree (bounded depth) for code exploration.
+async fn code_list_dir(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let root = std::path::PathBuf::from(&state.config.workspace_dir);
+    let dir = if path.is_empty() { root.clone() } else { resolve_workspace_path(state, path)? };
+    let mut items = Vec::new();
+    list_tree(&dir, &root, &mut items, 0, 3);
+    Ok(json!({ "items": items }))
+}
+
+fn list_tree(dir: &std::path::Path, root: &std::path::Path, items: &mut Vec<Value>, depth: u32, max_depth: u32) {
+    if depth > max_depth || items.len() >= 200 {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+            if path.is_dir() {
+                items.push(json!({ "path": relative, "type": "directory" }));
+                list_tree(&path, root, items, depth + 1, max_depth);
+            } else {
+                items.push(json!({
+                    "path": relative,
+                    "type": "file",
+                    "size": entry.metadata().map(|m| m.len()).unwrap_or(0),
+                }));
+            }
+        }
+    }
+}
+
+/// Search code with a text query across the workspace.
+async fn code_search(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("query is required".into()))?;
+    let root = std::path::PathBuf::from(&state.config.workspace_dir);
+    let mut matches = Vec::new();
+    search_code_recursive(&root, query, &mut matches, 0);
+    Ok(json!({ "matches": matches }))
+}
+
+fn search_code_recursive(dir: &std::path::Path, query: &str, matches: &mut Vec<Value>, depth: u32) {
+    if depth > 8 || matches.len() >= 50 {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                search_code_recursive(&path, query, matches, depth + 1);
+            } else if let Ok(content) = std::fs::read_to_string(&path) {
+                for (i, line) in content.lines().enumerate() {
+                    if line.contains(query) {
+                        matches.push(json!({
+                            "path": path.to_string_lossy(),
+                            "line": i + 1,
+                            "text": line.trim().chars().take(200).collect::<String>(),
+                        }));
+                        if matches.len() >= 50 {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +414,54 @@ mod tests {
         assert!(validate_public_url("http://192.168.1.1/x").is_err());
         assert!(validate_public_url("file:///etc/passwd").is_err());
         assert!(validate_public_url("http://service.internal/x").is_err());
+    }
+
+    #[tokio::test]
+    async fn code_edit_block_is_surgical() {
+        let (s, _d) = state().await;
+        execute_builtin(&s, "builtin.code_write_file", &json!({
+            "path": "src/main.py",
+            "content": "def main():\n    print('hello')\n    return 0\n"
+        })).await.unwrap();
+
+        // Unique match: succeeds.
+        let edited = execute_builtin(&s, "builtin.code_edit_block", &json!({
+            "path": "src/main.py",
+            "old_text": "print('hello')",
+            "new_text": "print('hello, world')"
+        })).await.unwrap();
+        assert_eq!(edited["edited"], true);
+        let read = execute_builtin(&s, "builtin.code_read_file", &json!({ "path": "src/main.py" })).await.unwrap();
+        assert!(read["content"].as_str().unwrap().contains("hello, world"));
+
+        // Ambiguous match: rejected.
+        execute_builtin(&s, "builtin.code_write_file", &json!({
+            "path": "src/dup.py",
+            "content": "x = 1\nx = 1\n"
+        })).await.unwrap();
+        let err = execute_builtin(&s, "builtin.code_edit_block", &json!({
+            "path": "src/dup.py",
+            "old_text": "x = 1",
+            "new_text": "y = 2"
+        })).await;
+        assert!(err.is_err());
+
+        // Missing match: rejected with guidance.
+        let err = execute_builtin(&s, "builtin.code_edit_block", &json!({
+            "path": "src/main.py",
+            "old_text": "not present",
+            "new_text": "x"
+        })).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn code_list_and_search() {
+        let (s, _d) = state().await;
+        execute_builtin(&s, "builtin.code_write_file", &json!({ "path": "a/b.py", "content": "value = 42" })).await.unwrap();
+        let tree = execute_builtin(&s, "builtin.code_list_dir", &json!({})).await.unwrap();
+        assert!(tree["items"].as_array().unwrap().iter().any(|i| i["path"] == "a/b.py"));
+        let search = execute_builtin(&s, "builtin.code_search", &json!({ "query": "42" })).await.unwrap();
+        assert_eq!(search["matches"].as_array().unwrap().len(), 1);
     }
 }

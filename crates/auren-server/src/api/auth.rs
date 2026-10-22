@@ -57,6 +57,9 @@ pub async fn login(
     }
     state.rate_limiter.clear(&identity);
 
+    // Ensure the user has a default agent (system-owned, not manual).
+    crate::api::health::create_default_agent(&state, &user_id, &Utc::now().to_rfc3339()).await;
+
     let token = auth::generate_session_token();
     let token_hash = auth::hash_session_token(&token, &state.config.session_secret);
     let now = Utc::now();

@@ -7,6 +7,7 @@ pub mod events;
 pub mod health;
 pub mod integrations;
 pub mod llm;
+pub mod mcp_servers;
 pub mod misc;
 pub mod pagination;
 pub mod rate_limit;
@@ -94,6 +95,7 @@ fn api_v1(state: AppState) -> Router<AppState> {
         .nest("/task-plans", task_plans::router())
         .nest("/approvals", approvals::router())
         .nest("/skills", skills::router())
+        .nest("/mcp-servers", mcp_servers::router())
         .nest("/memories", misc::memories_router())
         .nest("/notifications", misc::notifications_router())
         .nest("/workspace", misc::workspace_router())
