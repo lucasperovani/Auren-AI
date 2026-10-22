@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auren.ai/schemas/skill-manifest-1.json",
+  "title": "Auren skill manifest",
+  "description": "Schema for the skill.json manifest inside a skill package. The manifest may request capabilities but can never grant itself permissions; requests are validated against the application security policy during installation.",
+  "type": "object",
+  "required": ["schema_version", "id", "name", "version", "description", "entrypoint", "implementation_type"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Manifest schema version. Only version 1 is currently supported."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "maxLength": 64,
+      "description": "Stable skill identifier in lowercase kebab-case; used as the installation directory name."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?$",
+      "description": "Semantic version of the package."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "entrypoint": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$",
+      "description": "Package-relative entry point. For declarative skills this is the path to the primary tool definition directory or file. Absolute paths and '..' segments are rejected."
+    },
+    "implementation_type": {
+      "type": "string",
+      "enum": ["declarative", "builtin_ref"],
+      "description": "declarative: composes existing registered tools. Executable implementations are not supported in the first release."
+    },
+    "author": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Optional author name or organization."
+    },
+    "minimum_app_version": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$",
+      "description": "Minimum application version required by this skill."
+    },
+    "required_integrations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "Provider types the skill needs at execution time (for example \"gmail\"). Missing integrations leave the skill partially configured and unavailable for execution."
+    },
+    "required_permissions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "Requested capability names. The manifest cannot grant itself permissions; requests are validated against the application security policy, and effective authorization is decided at invocation time."
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["tool_name", "description", "input_schema", "risk_class", "implementation_type"],
+        "additionalProperties": false,
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$",
+            "description": "Tool name as exposed to agents; unique within the skill version."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "input_schema": {
+            "type": "object",
+            "description": "JSON Schema describing the tool's arguments."
+          },
+          "risk_class": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "implementation_type": {
+            "type": "string",
+            "enum": ["declarative", "builtin_ref"]
+          },
+          "implementation_ref": {
+            "type": "string",
+            "description": "Registered tool being referenced. Required when implementation_type is builtin_ref."
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "implementation_type": { "const": "builtin_ref" } } },
+            "then": { "required": ["implementation_ref"] }
+          }
+        ]
+      },
+      "description": "Tools declared by this skill. Every referenced tool must exist in the registry at validation time."
+    },
+    "dependencies": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "Identifiers of other skills this package depends on."
+    }
+  }
+}

@@ -1,0 +1,1120 @@
+openapi: 3.1.0
+info:
+  title: Auren-AI API
+  version: 0.1.0
+  description: |
+    REST API for the Auren-AI autonomous agent platform.
+
+    All endpoints require `Authorization: Bearer <session_token>` except the
+    health probes, setup, and login. Errors use the canonical envelope
+    (`error.code`, `error.message`, optional `error.details`). Large
+    collections use cursor pagination (`items` + `next_cursor`).
+servers:
+  - url: /api/v1
+tags:
+  - name: Health
+  - name: Auth
+  - name: Events
+  - name: Agents
+  - name: Conversations
+  - name: LLM
+  - name: Tasks
+  - name: TaskRuns
+  - name: TaskPlans
+  - name: Integrations
+  - name: Skills
+  - name: Approvals
+  - name: Memory
+  - name: Notifications
+  - name: Workspace
+  - name: Audit
+  - name: System
+paths:
+  /health/live:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+  /health/ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          description: Ready to serve requests
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+        "500":
+          $ref: "#/components/responses/Error"
+  /auth/setup-status:
+    get:
+      tags: [Auth]
+      summary: Whether initial administrator setup is required
+      security: []
+      responses:
+        "200":
+          description: Setup status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  setup_required: { type: boolean }
+  /auth/setup:
+    post:
+      tags: [Auth]
+      summary: Create the initial administrator
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, display_name, password]
+              properties:
+                email: { type: string, format: email }
+                display_name: { type: string, minLength: 1 }
+                password: { type: string, minLength: 8 }
+      responses:
+        "201":
+          description: Administrator created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "409":
+          description: Setup already completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Invalid email or password
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate and issue a session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: Session issued; the token is returned once and never stored in plaintext
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "401":
+          $ref: "#/components/responses/Error"
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the current session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+      responses:
+        "200":
+          description: Session revoked
+  /auth/me:
+    post:
+      tags: [Auth]
+      summary: Retrieve the current authenticated user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Error"
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change password and revoke all sessions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token, current_password, new_password]
+              properties:
+                session_token: { type: string }
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        "200":
+          description: Password changed
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /events/ticket:
+    post:
+      tags: [Events]
+      summary: Issue a single-use WebSocket upgrade ticket
+      description: >
+        Returns a short-lived (30 s), single-use ticket bound to the
+        authenticated user. Present it as the `ticket` query parameter on the
+        `GET /events` WebSocket upgrade. No reusable session token is placed
+        in a URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+      responses:
+        "200":
+          description: Ticket issued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket, expires_at]
+                properties:
+                  ticket: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "401":
+          $ref: "#/components/responses/Error"
+  /events:
+    get:
+      tags: [Events]
+      summary: WebSocket live event stream
+      description: >
+        Authenticated WebSocket upgrade. The `ticket` query parameter must be
+        a valid, unspent, unexpired ticket from `POST /events/ticket`. The
+        server pushes event envelopes (see docs/api/websocket.md) and pings
+        every 30 s. The channel is one-way; non-control client frames close
+        the connection.
+      parameters:
+        - name: ticket
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "101":
+          description: WebSocket upgrade accepted
+        "401":
+          $ref: "#/components/responses/Error"
+  /agents:
+    get:
+      tags: [Agents]
+      summary: List agents
+      responses:
+        "200":
+          description: Paginated agent list
+    post:
+      tags: [Agents]
+      summary: Create an agent
+      responses:
+        "201":
+          description: Agent created
+  /agents/{agent_id}:
+    get:
+      tags: [Agents]
+      summary: Retrieve agent details
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Agent details
+    patch:
+      tags: [Agents]
+      summary: Update agent
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Agent updated
+    delete:
+      tags: [Agents]
+      summary: Delete or archive an agent
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "204":
+          description: Agent removed
+  /conversations:
+    get:
+      tags: [Conversations]
+      summary: List conversations
+      responses:
+        "200":
+          description: Paginated conversation list
+    post:
+      tags: [Conversations]
+      summary: Create a conversation
+      responses:
+        "201":
+          description: Conversation created
+  /conversations/{conversation_id}/messages:
+    get:
+      tags: [Conversations]
+      summary: List messages
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Paginated message list
+    post:
+      tags: [Conversations]
+      summary: Submit a user message and initiate processing
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "202":
+          description: Processing accepted
+  /tasks:
+    get:
+      tags: [Tasks]
+      summary: List tasks with pagination and filters
+      responses:
+        "200":
+          description: Paginated task list
+    post:
+      tags: [Tasks]
+      summary: Create a structured task
+      responses:
+        "201":
+          description: Task created
+  /tasks/{task_id}:
+    get:
+      tags: [Tasks]
+      summary: Retrieve task details
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Task details
+    patch:
+      tags: [Tasks]
+      summary: Update task
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Task updated
+    delete:
+      tags: [Tasks]
+      summary: Cancel and delete or archive a task
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "204":
+          description: Task removed
+  /tasks/{task_id}/run:
+    post:
+      tags: [Tasks]
+      summary: Request immediate execution
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "202":
+          description: Run accepted
+  /tasks/{task_id}/pause:
+    post:
+      tags: [Tasks]
+      summary: Pause future executions
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Task paused
+  /tasks/{task_id}/resume:
+    post:
+      tags: [Tasks]
+      summary: Resume future executions
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Task resumed
+  /tasks/{task_id}/cancel:
+    post:
+      tags: [Tasks]
+      summary: Cancel active work where possible
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Cancellation requested
+  /tasks/{task_id}/runs:
+    get:
+      tags: [Tasks]
+      summary: List execution history
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Paginated run list
+  /tasks/{task_id}/schedule:
+    get:
+      tags: [Tasks]
+      summary: Retrieve scheduling information
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Schedule details
+    put:
+      tags: [Tasks]
+      summary: Update scheduling information
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schedule]
+              properties:
+                schedule:
+                  type: object
+                  required: [cron]
+                  properties:
+                    cron: { type: string, description: "5-field cron expression (UTC)" }
+                timezone: { type: string }
+      responses:
+        "200":
+          description: Schedule updated
+        "422":
+          $ref: "#/components/responses/Error"
+  /tasks/{task_id}/steps:
+    get:
+      tags: [Tasks]
+      summary: Inspect the latest execution steps
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Step list
+  /task-runs/{run_id}:
+    get:
+      tags: [TaskRuns]
+      summary: Retrieve execution status and results
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Run details
+  /task-runs/{run_id}/pause:
+    post:
+      tags: [TaskRuns]
+      summary: Pause an execution when safe
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Run paused
+        "409":
+          $ref: "#/components/responses/Error"
+  /task-runs/{run_id}/resume:
+    post:
+      tags: [TaskRuns]
+      summary: Resume a paused execution
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Run resumed
+  /task-runs/{run_id}/cancel:
+    post:
+      tags: [TaskRuns]
+      summary: Request cancellation (cooperative)
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Cancellation state
+  /task-runs/{run_id}/steps:
+    get:
+      tags: [TaskRuns]
+      summary: Retrieve execution steps
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Paginated step list
+  /task-runs/{run_id}/events:
+    get:
+      tags: [TaskRuns]
+      summary: Retrieve persisted execution events
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Paginated event list
+  /task-plans:
+    post:
+      tags: [TaskPlans]
+      summary: Interpret a natural-language request and generate a proposed plan
+      responses:
+        "201":
+          description: Plan created
+  /task-plans/{plan_id}/confirm:
+    post:
+      tags: [TaskPlans]
+      summary: Validate and create the persistent task
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "201":
+          description: Task created from plan
+  /llm/providers:
+    get:
+      tags: [LLM]
+      summary: List configured providers
+      responses:
+        "200":
+          description: Provider list; API keys are never returned
+    post:
+      tags: [LLM]
+      summary: Add a provider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, provider_type, base_url]
+              properties:
+                name: { type: string }
+                provider_type: { type: string, enum: [openai_compatible, anthropic, ollama, custom] }
+                base_url: { type: string, format: uri }
+                api_key: { type: string }
+      responses:
+        "201":
+          description: Provider created
+        "422":
+          $ref: "#/components/responses/Error"
+  /llm/providers/{provider_id}:
+    get:
+      tags: [LLM]
+      summary: Retrieve provider configuration without exposing secrets
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Provider details
+    patch:
+      tags: [LLM]
+      summary: Update provider configuration
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Provider updated
+    delete:
+      tags: [LLM]
+      summary: Remove a provider when not required by active work
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "204":
+          description: Provider removed
+        "409":
+          $ref: "#/components/responses/Error"
+  /llm/providers/{provider_id}/test:
+    post:
+      tags: [LLM]
+      summary: Test provider connectivity
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Reachability result
+  /llm/providers/{provider_id}/models:
+    get:
+      tags: [LLM]
+      summary: List available or configured models
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Model list
+  /task-plans/{plan_id}:
+    get:
+      tags: [TaskPlans]
+      summary: Retrieve the proposed plan and its validation state
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Plan details
+    patch:
+      tags: [TaskPlans]
+      summary: Refine the plan with additional information
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Plan updated
+  /task-plans/{plan_id}/clarifications:
+    post:
+      tags: [TaskPlans]
+      summary: Submit answers to clarification questions
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answers]
+              properties:
+                answers:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      question: { type: string }
+                      answer: { type: string }
+      responses:
+        "200":
+          description: Answers recorded
+  /task-plans/{plan_id}/cancel:
+    post:
+      tags: [TaskPlans]
+      summary: Discard the proposed plan
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Plan cancelled
+  /integrations:
+    get:
+      tags: [Integrations]
+      summary: List integration providers and configured connections
+      responses:
+        "200":
+          description: Integration list
+  /integrations/catalog:
+    get:
+      tags: [Integrations]
+      summary: List available integration types
+      responses:
+        "200":
+          description: Catalog
+  /integrations/{provider_type}/connect:
+    post:
+      tags: [Integrations]
+      summary: Initiate a connection flow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name: { type: string }
+                credentials: { type: object }
+      responses:
+        "201":
+          description: Integration connected
+  /integrations/oauth/callback:
+    get:
+      tags: [Integrations]
+      summary: Process the validated OAuth callback
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Callback processed
+        "400":
+          $ref: "#/components/responses/Error"
+  /integrations/{integration_id}:
+    get:
+      tags: [Integrations]
+      summary: Retrieve integration details
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Integration details
+    delete:
+      tags: [Integrations]
+      summary: Disconnect an integration
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "204":
+          description: Disconnected
+  /integrations/{integration_id}/accounts:
+    get:
+      tags: [Integrations]
+      summary: List connected accounts
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Account list
+  /integrations/{integration_id}/accounts/{account_id}:
+    get:
+      tags: [Integrations]
+      summary: Retrieve account status and granted scopes
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Account details
+  /integrations/{integration_id}/accounts/{account_id}/test:
+    post:
+      tags: [Integrations]
+      summary: Test the connection
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Connection test result
+  /integrations/{integration_id}/accounts/{account_id}/reconnect:
+    post:
+      tags: [Integrations]
+      summary: Reauthorize a connection
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Reconnected
+  /integrations/{integration_id}/accounts/{account_id}/capabilities:
+    get:
+      tags: [Integrations]
+      summary: List supported operations for the current account state
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Capability list
+  /skills:
+    get:
+      tags: [Skills]
+      summary: List installed skills
+      responses:
+        "200":
+          description: Skill list
+  /skills/uploads:
+    post:
+      tags: [Skills]
+      summary: Upload a skill ZIP for validation and installation (multipart/form-data)
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "202":
+          description: Upload accepted; poll the status endpoint
+  /skills/uploads/{upload_id}:
+    get:
+      tags: [Skills]
+      summary: Retrieve upload and installation status
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Upload status
+  /skills/{skill_id}:
+    get:
+      tags: [Skills]
+      summary: Retrieve skill metadata and current version
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Skill details
+    patch:
+      tags: [Skills]
+      summary: Update permitted skill settings
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Skill updated
+    delete:
+      tags: [Skills]
+      summary: Uninstall a skill
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "204":
+          description: Skill uninstalled
+  /skills/{skill_id}/enable:
+    post:
+      tags: [Skills]
+      summary: Enable a skill
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Skill enabled
+        "409":
+          $ref: "#/components/responses/Error"
+  /skills/{skill_id}/disable:
+    post:
+      tags: [Skills]
+      summary: Disable a skill
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Skill disabled
+  /skills/{skill_id}/versions:
+    get:
+      tags: [Skills]
+      summary: List installed versions
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Version list
+  /skills/{skill_id}/versions/{version_id}/activate:
+    post:
+      tags: [Skills]
+      summary: Activate a validated version
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Version activated
+  /skills/{skill_id}/validate:
+    post:
+      tags: [Skills]
+      summary: Revalidate the installed package and capabilities
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Validation result
+  /skills/{skill_id}/permissions:
+    get:
+      tags: [Skills]
+      summary: Inspect declared permissions
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Declared permissions
+    put:
+      tags: [Skills]
+      summary: Update configurable permissions
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Permissions updated
+  /skills/{skill_id}/tools:
+    get:
+      tags: [Skills]
+      summary: List the tools declared by the active version
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Tool list
+  /approvals:
+    get:
+      tags: [Approvals]
+      summary: List pending and historical approvals
+      responses:
+        "200":
+          description: Approval list
+  /approvals/{approval_id}/approve:
+    post:
+      tags: [Approvals]
+      summary: Approve a specific operation
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Operation approved
+  /approvals/{approval_id}:
+    get:
+      tags: [Approvals]
+      summary: Retrieve the complete operation details
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Approval details including the canonical operation payload
+  /approvals/{approval_id}/reject:
+    post:
+      tags: [Approvals]
+      summary: Reject a specific operation
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Operation rejected
+  /approvals/{approval_id}/cancel:
+    post:
+      tags: [Approvals]
+      summary: Cancel a pending approval request when permitted
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Approval cancelled
+  /memories:
+    get:
+      tags: [Memory]
+      summary: List memories
+      responses:
+        "200":
+          description: Paginated memory list
+    post:
+      tags: [Memory]
+      summary: Create a memory
+      responses:
+        "201":
+          description: Memory created
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: List notifications
+      responses:
+        "200":
+          description: Paginated notification list
+  /workspace/files:
+    get:
+      tags: [Workspace]
+      summary: List files in authorized directories
+      responses:
+        "200":
+          description: File listing
+  /audit-events:
+    get:
+      tags: [Audit]
+      summary: List authorized audit events
+      responses:
+        "200":
+          description: Paginated audit event list
+  /memories/{memory_id}:
+    get:
+      tags: [Memory]
+      summary: Retrieve a memory
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Memory details
+    delete:
+      tags: [Memory]
+      summary: Delete a memory
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "204":
+          description: Memory deleted
+  /notifications/{notification_id}:
+    get:
+      tags: [Notifications]
+      summary: Retrieve a notification
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Notification details
+    delete:
+      tags: [Notifications]
+      summary: Delete a notification when permitted
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "204":
+          description: Notification deleted
+  /notifications/{notification_id}/read:
+    post:
+      tags: [Notifications]
+      summary: Mark a notification as read
+      description: Reading never authorizes an operation; approvals use the approval endpoints.
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Notification marked read
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      responses:
+        "200":
+          description: Count updated
+  /workspace/config:
+    get:
+      tags: [Workspace]
+      summary: Retrieve workspace configuration
+      responses:
+        "200":
+          description: Workspace configuration
+    patch:
+      tags: [Workspace]
+      summary: Update the permitted workspace configuration
+      responses:
+        "200":
+          description: Configuration updated
+  /workspace/files/content:
+    get:
+      tags: [Workspace]
+      summary: Read a permitted file
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: File content
+        "403":
+          $ref: "#/components/responses/Error"
+    put:
+      tags: [Workspace]
+      summary: Create or update a permitted file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, content]
+              properties:
+                path: { type: string }
+                content: { type: string }
+      responses:
+        "200":
+          description: File written
+        "403":
+          $ref: "#/components/responses/Error"
+  /workspace/files:
+    delete:
+      tags: [Workspace]
+      summary: Delete a permitted file under the applicable policy
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: File deleted
+        "403":
+          $ref: "#/components/responses/Error"
+  /audit-events/{event_id}:
+    get:
+      tags: [Audit]
+      summary: Retrieve an audit event
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Audit event details
+  /system/status:
+    get:
+      tags: [System]
+      summary: Retrieve authenticated operational status
+      responses:
+        "200":
+          description: Operational status; no credentials or internal details
+components:
+  parameters:
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        is_admin: { type: boolean }
+        created_at: { type: string, format: date-time }
+    TokenRequest:
+      type: object
+      required: [session_token]
+      properties:
+        session_token: { type: string }
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+  responses:
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+security:
+  - bearerAuth: []
+components.securitySchemes:
+  bearerAuth:
+    type: http
+    scheme: bearer
