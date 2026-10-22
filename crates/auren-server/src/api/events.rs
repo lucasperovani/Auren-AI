@@ -162,9 +162,13 @@ mod tests {
                 skills_dir: "data/skills".into(),
                 max_upload_bytes: 1024,
                 session_secret: "test-secret".into(),
+            workspace_dir: "data/workspace".into(),
+            max_workspace_file_bytes: 1024 * 1024,
+            credential_encryption_key: "k".into(),
             },
             events: std::sync::Arc::new(crate::events::EventBus::new()),
             ws_tickets: std::sync::Arc::new(crate::events::TicketStore::new()),
+            rate_limiter: std::sync::Arc::new(crate::api::rate_limit::RateLimiter::new()),
         }
     }
 }

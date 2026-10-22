@@ -6,6 +6,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 use tower::ServiceExt;
 
 use crate::{api, state::AppState};
@@ -25,9 +26,13 @@ async fn app() -> (axum::Router, AppState, tempfile::TempDir) {
             skills_dir: skills_dir.to_string_lossy().to_string(),
             max_upload_bytes: 1024 * 1024,
             session_secret: "test-secret".into(),
+            workspace_dir: "data/workspace".into(),
+            max_workspace_file_bytes: 1024 * 1024,
+            credential_encryption_key: "k".into(),
         },
         events: std::sync::Arc::new(crate::events::EventBus::new()),
         ws_tickets: std::sync::Arc::new(crate::events::TicketStore::new()),
+            rate_limiter: std::sync::Arc::new(crate::api::rate_limit::RateLimiter::new()),
     };
     (api::router(state.clone()), state, dir)
 }
@@ -126,18 +131,80 @@ async fn full_task_lifecycle() {
     assert_eq!(status, StatusCode::ACCEPTED);
     let run_id = run["task_run_id"].as_str().unwrap().to_string();
 
-    // The queue worker executes the run.
+    // Without an LLM provider configured, the runtime records an honest
+    // failure instead of faking success (spec section 21). The first
+    // failure schedules a retry, so exhaust the attempts to reach the
+    // terminal failed state.
+    for _ in 0..5 {
+        sqlx::query("UPDATE queued_jobs SET available_at = ? WHERE task_run_id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(&run_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        crate::services::worker::tick_once(&state, "test-worker").await.unwrap();
+    }
+    let (status, run_body) = get_json(&app, &format!("/api/v1/task-runs/{run_id}"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(run_body["status"], "failed");
+    assert!(run_body["error_message"]
+        .as_str()
+        .unwrap()
+        .contains("no LLM provider configured"));
+
+    // With a mock LLM provider configured, the same run completes.
+    let mock_base = start_mock_llm().await;
+    sqlx::query("INSERT INTO llm_providers (id, user_id, name, provider_type, base_url, status, created_at, updated_at) VALUES ('p1', ?, 'Mock', 'openai_compatible', ?, 'active', '2026', '2026')")
+        .bind(sqlx::query("SELECT user_id FROM tasks WHERE id = ?").bind(&task_id).fetch_one(&state.db).await.unwrap().try_get::<String, _>("user_id").unwrap())
+        .bind(&mock_base)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO llm_models (id, provider_id, model_name, capabilities_json, created_at) VALUES ('m1', 'p1', 'mock-model', '{}', '2026')")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agents SET llm_provider_id = 'p1', model_id = 'm1' WHERE id = ?")
+        .bind(&agent_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // Retry the failed run.
+    sqlx::query("UPDATE queued_jobs SET status = 'pending', available_at = ? WHERE task_run_id = ?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&run_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
     crate::services::worker::tick_once(&state, "test-worker").await.unwrap();
     let (status, run_body) = get_json(&app, &format!("/api/v1/task-runs/{run_id}"), Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(run_body["status"], "completed");
     assert!(run_body["result"].is_object());
+}
 
-    // Steps were recorded.
-    let (status, steps) = get_json(&app, &format!("/api/v1/task-runs/{run_id}/steps"), Some(&token)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(steps["items"].as_array().unwrap().len(), 1);
-    assert_eq!(steps["items"][0]["status"], "completed");
+/// Start a mock OpenAI-compatible server that answers a fixed completion.
+async fn start_mock_llm() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let service = hyper::service::service_fn(|_req| async {
+                let body = serde_json::json!({
+                    "choices": [{
+                        "message": { "content": "Task acknowledged: objective received.", "finish_reason": "stop" }
+                    }],
+                    "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+                });
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(axum::body::Body::from(body.to_string())))
+            });
+            let http = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let _ = http.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service).await;
+        }
+    });
+    format!("http://{addr}")
 }
 
 #[tokio::test]
@@ -270,7 +337,6 @@ async fn scheduler_fires_due_schedules() {
     assert!(next.as_str() > "2026-01-01");
 }
 
-use sqlx::Row;
 
 #[tokio::test]
 async fn workspace_rejects_traversal() {

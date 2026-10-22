@@ -23,9 +23,13 @@ async fn state() -> (AppState, tempfile::TempDir) {
             skills_dir: skills_dir.to_string_lossy().to_string(),
             max_upload_bytes: 1024 * 1024,
             session_secret: "s".into(),
+                workspace_dir: "data/workspace".into(),
+                max_workspace_file_bytes: 1024 * 1024,
+                credential_encryption_key: "k".into(),
         },
         events: std::sync::Arc::new(crate::events::EventBus::new()),
         ws_tickets: std::sync::Arc::new(crate::events::TicketStore::new()),
+            rate_limiter: std::sync::Arc::new(crate::api::rate_limit::RateLimiter::new()),
     };
     sqlx::query("INSERT INTO users (id, email, display_name, password_hash, is_admin, created_at, updated_at) VALUES ('u1','a@b.com','A','x',1,'2026','2026')")
         .execute(&s.db)

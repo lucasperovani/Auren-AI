@@ -299,14 +299,10 @@ pub fn workspace_router() -> Router<AppState> {
         .route("/files/content", get(read_file).put(write_file))
 }
 
-/// The single authorized workspace root. Every file operation resolves
-/// against this root and rejects traversal outside it (spec 3.14).
+/// The single authorized workspace root (spec section 4). Every file
+/// operation resolves against this root and rejects traversal outside it.
 fn workspace_root(state: &AppState) -> std::path::PathBuf {
-    std::path::PathBuf::from(&state.config.skills_dir)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("data"))
-        .join("workspace")
+    std::path::PathBuf::from(&state.config.workspace_dir)
 }
 
 /// Resolve a relative path against the root, rejecting traversal.

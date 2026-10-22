@@ -26,25 +26,36 @@ pub struct LoginRequest {
 }
 
 /// Authenticate and issue a session. The plaintext token is returned once and
-/// only its hash is stored (spec 2.2).
+/// only its hash is stored (spec 2.2). Failed attempts are rate limited per
+/// email (spec section 15).
 pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let identity = req.email.trim().to_lowercase();
+    if state.rate_limiter.is_locked(&identity) {
+        return Err(ApiError::TooManyRequests);
+    }
+
     let row = sqlx::query("SELECT id, password_hash FROM users WHERE email = ?")
-        .bind(req.email.trim().to_lowercase())
+        .bind(&identity)
         .fetch_optional(&state.db)
         .await?;
 
     let (user_id, password_hash) = match row {
         Some(r) => (r.get::<String, _>("id"), r.get::<String, _>("password_hash")),
         // Constant-ish response: do not reveal whether the email exists.
-        None => return Err(ApiError::Unauthorized),
+        None => {
+            state.rate_limiter.record_failure(&identity);
+            return Err(ApiError::Unauthorized);
+        }
     };
 
     if !auth::verify_password(&req.password, &password_hash)? {
+        state.rate_limiter.record_failure(&identity);
         return Err(ApiError::Unauthorized);
     }
+    state.rate_limiter.clear(&identity);
 
     let token = auth::generate_session_token();
     let token_hash = auth::hash_session_token(&token, &state.config.session_secret);

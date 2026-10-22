@@ -1,0 +1,34 @@
+services:
+  auren:
+    build: .
+    container_name: auren-ai
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Session token pepper. Generate a unique value for production:
+      #   openssl rand -hex 32
+      - AUREN_SESSION_SECRET=${AUREN_SESSION_SECRET:?set AUREN_SESSION_SECRET in .env}
+      # Credential encryption key, kept separate from encrypted records:
+      #   openssl rand -hex 32
+      - AUREN_CREDENTIAL_ENCRYPTION_KEY=${AUREN_CREDENTIAL_ENCRYPTION_KEY:-}
+      # Optional host directory mapped as the agent workspace. When set,
+      # the container uses /workspace (AI_WORKSPACE_CONTAINER_PATH).
+      - AI_WORKSPACE_CONTAINER_PATH=${AI_WORKSPACE_CONTAINER_PATH:-/workspace}
+    volumes:
+      # Application data: SQLite database and installed skills.
+      - auren-data:/data
+      # Agent workspace. Configure AI_WORKSPACE_HOST_PATH in .env to map a
+      # host directory (for example ./workspace); it defaults to a named
+      # volume so the deployment works out of the box.
+      - ${AI_WORKSPACE_HOST_PATH:-auren-workspace}:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  auren-data:
+  auren-workspace:

@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Auren-AI</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Login / setup gate -->
+    <div id="auth-view" class="auth-view hidden">
+      <div class="auth-card">
+        <h1>Auren-AI</h1>
+        <p id="auth-subtitle" class="muted"></p>
+        <form id="auth-form">
+          <input id="auth-email" type="email" placeholder="Email" autocomplete="username" required>
+          <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password" required>
+          <input id="auth-display-name" type="text" placeholder="Display name" class="hidden">
+          <button id="auth-submit" type="submit">Sign in</button>
+        </form>
+        <p id="auth-error" class="error hidden"></p>
+      </div>
+    </div>
+
+    <!-- Main application -->
+    <div id="main-view" class="hidden">
+      <header class="topbar">
+        <button class="menu-toggle" id="menu-toggle" aria-label="Menu">☰</button>
+        <span class="brand">Auren-AI</span>
+        <span class="spacer"></span>
+        <span id="connection-status" class="conn-status" title="Live events">●</span>
+        <span id="user-name" class="muted"></span>
+        <button id="logout-btn" class="btn-ghost">Sign out</button>
+      </header>
+      <nav class="sidebar" id="sidebar">
+        <a href="#dashboard" class="nav-link active" data-view="dashboard">Dashboard</a>
+        <a href="#chat" class="nav-link" data-view="chat">Chat</a>
+        <a href="#tasks" class="nav-link" data-view="tasks">Tasks</a>
+        <a href="#skills" class="nav-link" data-view="skills">Skills</a>
+        <a href="#integrations" class="nav-link" data-view="integrations">Integrations</a>
+        <a href="#approvals" class="nav-link" data-view="approvals">Approvals</a>
+        <a href="#settings" class="nav-link" data-view="settings">Settings</a>
+      </nav>
+      <main class="content" id="content"></main>
+    </div>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

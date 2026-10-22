@@ -15,6 +15,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = auren_server::config::AppConfig::from_env()?;
+
+    // Create the persistent directories at startup (spec section 4).
+    for dir in [&config.skills_dir, &config.workspace_dir] {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create directory {dir}"))?;
+    }
+    if let Some(parent) = std::path::Path::new(&config.database_url)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let pool = auren_server::db::connect(&config.database_url).await?;
     auren_server::db::migrate(&pool).await.context("database migrations failed")?;
 
@@ -23,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         events: std::sync::Arc::new(auren_server::events::EventBus::new()),
         ws_tickets: std::sync::Arc::new(auren_server::events::TicketStore::new()),
+        rate_limiter: std::sync::Arc::new(auren_server::api::rate_limit::RateLimiter::new()),
     };
 
     // Background scheduler and queue worker.

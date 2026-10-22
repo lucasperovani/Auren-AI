@@ -301,10 +301,13 @@ pub async fn get_schedule(
     Path(task_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     TaskService::new(&state).require_owned(&user.id, &task_id).await?;
-    let row = sqlx::query("SELECT schedule_json, timezone FROM scheduled_jobs WHERE task_id = ?")
-        .bind(&task_id)
-        .fetch_optional(&state.db)
-        .await?;
+    let row = sqlx::query(
+        "SELECT j.schedule_json, t.timezone FROM scheduled_jobs j
+         JOIN tasks t ON t.id = j.task_id WHERE j.task_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_optional(&state.db)
+    .await?;
     match row {
         Some(r) => {
             let schedule_json: String = r.get("schedule_json");

@@ -1,0 +1,13 @@
+target/
+.git/
+.gitignore
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+docs/
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore

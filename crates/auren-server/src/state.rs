@@ -11,4 +11,6 @@ pub struct AppState {
     pub events: Arc<EventBus>,
     /// Single-use WebSocket upgrade tickets.
     pub ws_tickets: Arc<TicketStore>,
+    /// Login rate limiter (spec section 15).
+    pub rate_limiter: Arc<crate::api::rate_limit::RateLimiter>,
 }

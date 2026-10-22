@@ -6,6 +6,10 @@
 
 pub mod approvals;
 pub mod audit;
+pub mod agent_runtime;
+pub mod builtins;
+pub mod credentials;
+pub mod llm;
 pub mod notifications;
 pub mod scheduler;
 pub mod skill_installer;

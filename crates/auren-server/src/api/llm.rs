@@ -20,7 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/{provider_id}", get(get_provider).patch(update_provider).delete(delete_provider))
         .route("/providers/{provider_id}/test", post(test_provider))
-        .route("/providers/{provider_id}/models", get(list_models))
+        .route("/providers/{provider_id}/models", get(list_models).post(add_model))
 }
 
 #[derive(Deserialize)]
@@ -114,18 +114,26 @@ pub async fn create_provider(
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    // API keys are stored encrypted at rest; the plaintext is never persisted.
-    let encrypted = req.api_key.as_deref().map(|k| k.as_bytes().to_vec());
+    // API keys are stored encrypted at rest (spec section 14); the
+    // plaintext is never persisted or returned.
+    let encrypted = match &req.api_key {
+        Some(key) => {
+            let (ct, nonce) = crate::services::credentials::encrypt_credential(key, &state.config.credential_encryption_key)?;
+            Some((ct, nonce))
+        }
+        None => None,
+    };
     sqlx::query(
-        "INSERT INTO llm_providers (id, user_id, name, provider_type, base_url, encrypted_api_key, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+        "INSERT INTO llm_providers (id, user_id, name, provider_type, base_url, encrypted_api_key, key_nonce, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
     )
     .bind(&id)
     .bind(&user.id)
     .bind(req.name.trim())
     .bind(&req.provider_type)
     .bind(&req.base_url)
-    .bind(encrypted)
+    .bind(encrypted.as_ref().map(|(ct, _)| ct.clone()))
+    .bind(encrypted.as_ref().map(|(_, n)| n.clone()))
     .bind(&now)
     .bind(&now)
     .execute(&state.db)
@@ -186,8 +194,9 @@ pub async fn update_provider(
             .bind(u).bind(&now).bind(&provider_id).execute(&state.db).await?;
     }
     if let Some(k) = &req.api_key {
-        sqlx::query("UPDATE llm_providers SET encrypted_api_key = ?, updated_at = ? WHERE id = ?")
-            .bind(k.as_bytes().to_vec()).bind(&now).bind(&provider_id).execute(&state.db).await?;
+        let (ct, nonce) = crate::services::credentials::encrypt_credential(k, &state.config.credential_encryption_key)?;
+        sqlx::query("UPDATE llm_providers SET encrypted_api_key = ?, key_nonce = ?, updated_at = ? WHERE id = ?")
+            .bind(ct).bind(nonce).bind(&now).bind(&provider_id).execute(&state.db).await?;
     }
     if let Some(s) = &req.status {
         if !matches!(s.as_str(), "active" | "disabled") {
@@ -261,6 +270,40 @@ pub struct AddModelRequest {
     pub model_name: String,
     #[serde(default)]
     pub capabilities: serde_json::Value,
+}
+
+/// Register a model with the provider. Capabilities are stored explicitly
+/// (spec section 2.2: never assume tool calling or structured output).
+pub async fn add_model(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(provider_id): Path<String>,
+    Json(req): Json<AddModelRequest>,
+) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+    require_owned_provider(&state, &user, &provider_id).await?;
+    if req.model_name.trim().is_empty() {
+        return Err(ApiError::Unprocessable("model_name is required".into()));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let capabilities = if req.capabilities.is_null() || req.capabilities.as_object().is_none() {
+        serde_json::json!({})
+    } else {
+        req.capabilities
+    };
+    sqlx::query(
+        "INSERT INTO llm_models (id, provider_id, model_name, capabilities_json, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&provider_id)
+    .bind(req.model_name.trim())
+    .bind(capabilities.to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.db)
+    .await?;
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "model_name": req.model_name.trim() })),
+    ))
 }
 
 pub async fn list_models(

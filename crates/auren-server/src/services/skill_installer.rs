@@ -525,7 +525,16 @@ pub fn validate_entry_name(name: &str) -> Result<(), String> {
 
 /// Builtins a declarative tool may reference (spec 5.3: a skill may compose
 /// existing validated tools; arbitrary URLs are never trusted).
-const KNOWN_BUILTINS: &[&str] = &["builtin.echo", "builtin.noop"];
+const KNOWN_BUILTINS: &[&str] = &[
+    "builtin.echo",
+    "builtin.noop",
+    "builtin.file_list",
+    "builtin.file_read",
+    "builtin.file_write",
+    "builtin.file_delete",
+    "builtin.file_search",
+    "builtin.web_fetch",
+];
 
 fn valid_skill_id(id: &str) -> bool {
     !id.is_empty()

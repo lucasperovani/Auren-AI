@@ -15,6 +15,7 @@ const ALWAYS_ASK_RISK_CLASSES: [&str; 2] = ["high", "critical"];
 
 pub struct ToolRegistry {
     db: SqlitePool,
+    state: AppState,
     approvals: super::approvals::ApprovalService,
 }
 
@@ -33,6 +34,7 @@ impl ToolRegistry {
     pub fn new(state: &AppState) -> Self {
         Self {
             db: state.db.clone(),
+            state: state.clone(),
             approvals: super::approvals::ApprovalService::new(state),
         }
     }
@@ -212,13 +214,7 @@ impl ToolRegistry {
             ApiError::Unprocessable("declarative tool has no implementation reference".into())
         })?;
 
-        match reference.as_str() {
-            "builtin.echo" => Ok(args.clone()),
-            "builtin.noop" => Ok(json!({ "ok": true })),
-            other => Err(ApiError::Unprocessable(format!(
-                "unknown builtin implementation '{other}'"
-            ))),
-        }
+        super::builtins::execute_builtin(&self.state, &reference, args).await
     }
 }
 
@@ -241,9 +237,13 @@ mod tests {
                 skills_dir: "data/skills".into(),
                 max_upload_bytes: 1024,
                 session_secret: "s".into(),
+                workspace_dir: "data/workspace".into(),
+                max_workspace_file_bytes: 1024 * 1024,
+                credential_encryption_key: "k".into(),
             },
             events: std::sync::Arc::new(crate::events::EventBus::new()),
             ws_tickets: std::sync::Arc::new(crate::events::TicketStore::new()),
+            rate_limiter: std::sync::Arc::new(crate::api::rate_limit::RateLimiter::new()),
         }
     }
 
