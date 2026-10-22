@@ -151,6 +151,13 @@ body.sidebar-collapsed .content { margin-left: 0; }
   padding: 8px; overflow-x: auto; font-size: 0.75rem; margin: 4px 0 8px;
   white-space: pre-wrap; word-break: break-word;
 }
+
+/* Skill versions */
+.skill-version-row {
+  display: flex; align-items: center; gap: 8px; padding: 4px 0;
+  border-top: 1px solid var(--border); font-size: 0.85rem;
+}
+.skill-version-row:first-child { border-top: none; }
 .nav-link {
   color: var(--muted); text-decoration: none; padding: 9px 12px;
   border-radius: 6px; font-size: 0.95rem;

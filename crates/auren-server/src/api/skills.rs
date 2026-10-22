@@ -29,6 +29,7 @@ pub fn router() -> Router<AppState> {
         .route("/{skill_id}/disable", post(disable_skill))
         .route("/{skill_id}/versions", get(list_versions))
         .route("/{skill_id}/versions/{version_id}/activate", post(activate_version))
+        .route("/{skill_id}/versions/{version_id}", axum::routing::delete(delete_version))
         .route("/{skill_id}/validate", post(validate_skill))
         .route("/{skill_id}/permissions", get(get_permissions).put(put_permissions))
         .route("/{skill_id}/tools", get(list_tools))
@@ -324,6 +325,40 @@ pub async fn list_versions(
         })
         .collect();
     Ok(Json(json!({ "items": items, "next_cursor": null })))
+}
+
+/// Delete a non-active skill version: removes the database record and the
+/// package files. The active version is protected (delete or supersede it
+/// first).
+pub async fn delete_version(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path((skill_id, version_id)): Path<(String, String)>,
+) -> ApiResult<axum::http::StatusCode> {
+    require_skill(&state, &skill_id).await?;
+    let row = sqlx::query("SELECT status, install_path FROM skill_versions WHERE id = ? AND skill_id = ?")
+        .bind(&version_id)
+        .bind(&skill_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let status: String = row.get("status");
+    if status == "active" {
+        return Err(ApiError::Conflict("cannot delete the active version; activate another version first".into()));
+    }
+    let install_path: String = row.get("install_path");
+    let mut tx = state.db.begin().await.map_err(ApiError::from)?;
+    sqlx::query("DELETE FROM skill_versions WHERE id = ?")
+        .bind(&version_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await.map_err(ApiError::from)?;
+    // Package files are removed only after the record is gone.
+    let dir = std::path::Path::new(&install_path);
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Activate a validated version. The previous active version is preserved

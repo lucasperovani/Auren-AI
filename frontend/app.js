@@ -605,7 +605,9 @@ views.skills = async (content) => {
           <button class="btn btn-sm btn-secondary" data-action="enable">Enable</button>
           <button class="btn btn-sm btn-secondary" data-action="disable">Disable</button>
           <button class="btn btn-sm btn-danger" data-action="uninstall">Uninstall</button>
+          <button class="btn btn-sm btn-secondary" data-action="versions">Versions</button>
         </div>
+        <div class="skill-versions" style="margin-top:8px"></div>
       </div>`).join('')}</div>` : '<div class="empty-state">No skills installed yet.</div>'}
   `;
 
@@ -700,14 +702,47 @@ views.skills = async (content) => {
   content.querySelectorAll('.card[data-id] button').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const skillId = btn.closest('.card').dataset.id;
+      const action = btn.dataset.action;
       try {
-        await api('POST', `/skills/${skillId}/${btn.dataset.action}`, {});
-        toast(`Skill ${btn.dataset.action} done`, 'success');
+        if (action === 'versions') {
+          await showSkillVersions(skillId, btn.closest('.card'));
+          return;
+        }
+        await api('POST', `/skills/${skillId}/${action}`, {});
+        toast(`Skill ${action} done`, 'success');
         navigate('skills');
       } catch (err) { toast(err.message, 'error'); }
     });
   });
 };
+
+/// Show a skill's installed versions with per-version delete (old versions
+/// can be cleaned up; the active version is protected server-side).
+async function showSkillVersions(skillId, card) {
+  const container = card.querySelector('.skill-versions');
+  container.innerHTML = '<span class="muted" style="font-size:.85rem">Loading…</span>';
+  try {
+    const { items } = await api('GET', `/skills/${skillId}/versions`);
+    container.innerHTML = items.length ? items.map((v) => `
+      <div class="skill-version-row" data-version="${esc(v.id)}">
+        <span class="badge ${esc(v.status)}">${esc(v.version)}</span>
+        <span class="muted" style="font-size:.8rem">${esc(v.installed_at.slice(0, 10))}</span>
+        ${v.status !== 'active' ? `<button class="btn btn-sm btn-danger" data-delete-version="${esc(v.id)}">Delete</button>` : '<span class="badge active">in use</span>'}
+      </div>`).join('') : '<span class="muted" style="font-size:.85rem">no versions</span>';
+    container.querySelectorAll('[data-delete-version]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Delete this version?')) return;
+        try {
+          await api('DELETE', `/skills/${skillId}/versions/${btn.dataset.deleteVersion}`);
+          toast('Version deleted', 'success');
+          showSkillVersions(skillId, card);
+        } catch (err) { toast(err.message, 'error'); }
+      });
+    });
+  } catch (err) {
+    container.innerHTML = `<span class="error" style="font-size:.85rem">${esc(err.message)}</span>`;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Integrations
