@@ -2,3 +2,4 @@
 - As tasks não podem mostrar o formato do tempo como no cron, precisa ser algo bonitinho
 - Corrigir/Remover testes flakiness
 - Melhorar e muito a interface
+- Listar/Puxar skills/tools/mcp de um outro github

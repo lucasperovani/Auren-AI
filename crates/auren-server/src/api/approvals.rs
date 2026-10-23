@@ -44,13 +44,14 @@ pub async fn list_approvals(
         "SELECT a.* FROM approval_requests a
          LEFT JOIN task_runs r ON r.id = a.task_run_id
          LEFT JOIN tasks t ON t.id = r.task_id
-         WHERE (t.user_id = ? OR a.task_run_id IS NULL)",
+         LEFT JOIN conversations c ON c.id = a.conversation_id
+         WHERE (t.user_id = ? OR c.user_id = ? OR (a.task_run_id IS NULL AND a.conversation_id IS NULL))",
     );
     if params.status.is_some() {
         sql.push_str(" AND a.status = ?");
     }
     sql.push_str(" AND a.id > ? ORDER BY a.id LIMIT ?");
-    let mut query = sqlx::query(&sql).bind(&user.id);
+    let mut query = sqlx::query(&sql).bind(&user.id).bind(&user.id);
     if let Some(s) = &params.status {
         query = query.bind(s);
     }
@@ -62,9 +63,14 @@ pub async fn list_approvals(
         .iter()
         .take(limit as usize)
         .map(|r| {
+            let operation: String = r.get::<String, _>("operation_json");
+            let operation = serde_json::from_str::<serde_json::Value>(&operation).unwrap_or(json!({}));
             json!({
                 "id": r.get::<String, _>("id"),
                 "task_run_id": r.get::<Option<String>, _>("task_run_id"),
+                "conversation_id": r.try_get::<Option<String>, _>("conversation_id").unwrap_or(None),
+                "tool_name": operation.get("tool_name").cloned().unwrap_or(json!(null)),
+                "args": operation.get("args").cloned().unwrap_or(json!(null)),
                 "status": r.get::<String, _>("status"),
                 "expires_at": r.get::<String, _>("expires_at"),
                 "created_at": r.get::<String, _>("created_at"),
@@ -90,9 +96,11 @@ pub async fn get_approval(
         .fetch_optional(&state.db)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // Ownership: the approval must belong to a run of one of the user's tasks
-    // (or be a system-level request visible to admins).
+    // Ownership: the approval must belong to a run of one of the user's
+    // tasks, to one of the user's conversations, or be a system-level
+    // request visible to admins.
     let task_run_id: Option<String> = row.get("task_run_id");
+    let conversation_id: Option<String> = row.try_get("conversation_id").unwrap_or(None);
     if let Some(run_id) = &task_run_id {
         let task = sqlx::query("SELECT t.user_id FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = ?")
             .bind(run_id)
@@ -100,6 +108,16 @@ pub async fn get_approval(
             .await?
             .ok_or(ApiError::NotFound)?;
         let owner: String = task.get("user_id");
+        if owner != user.id {
+            return Err(ApiError::NotFound);
+        }
+    } else if let Some(conversation_id) = &conversation_id {
+        let conversation = sqlx::query("SELECT user_id FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let owner: String = conversation.get("user_id");
         if owner != user.id {
             return Err(ApiError::NotFound);
         }
@@ -111,6 +129,7 @@ pub async fn get_approval(
     Ok(Json(json!({
         "id": row.get::<String, _>("id"),
         "task_run_id": task_run_id,
+        "conversation_id": conversation_id,
         "skill_tool_id": row.get::<Option<String>, _>("skill_tool_id"),
         "operation": serde_json::from_str::<serde_json::Value>(&operation_json).unwrap_or(json!({})),
         "status": row.get::<String, _>("status"),
@@ -158,19 +177,31 @@ pub async fn cancel(
     user: AuthUser,
     Path(approval_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    // Only the owner of the related task may cancel.
-    let row = sqlx::query("SELECT task_run_id FROM approval_requests WHERE id = ?")
+    // Only the owner of the related task or conversation may cancel.
+    let row = sqlx::query("SELECT task_run_id, conversation_id FROM approval_requests WHERE id = ?")
         .bind(&approval_id)
         .fetch_optional(&state.db)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if let Some(run_id) = row.get::<Option<String>, _>("task_run_id") {
+    let run_id: Option<String> = row.get("task_run_id");
+    let conversation_id: Option<String> = row.try_get("conversation_id").unwrap_or(None);
+    if let Some(run_id) = &run_id {
         let task = sqlx::query("SELECT t.user_id FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = ?")
-            .bind(&run_id)
+            .bind(run_id)
             .fetch_optional(&state.db)
             .await?
             .ok_or(ApiError::NotFound)?;
         let owner: String = task.get("user_id");
+        if owner != user.id {
+            return Err(ApiError::NotFound);
+        }
+    } else if let Some(conversation_id) = &conversation_id {
+        let conversation = sqlx::query("SELECT user_id FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let owner: String = conversation.get("user_id");
         if owner != user.id {
             return Err(ApiError::NotFound);
         }

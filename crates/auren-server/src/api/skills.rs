@@ -46,8 +46,8 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("instagram-skill", "Instagram: account info, media, and publishing (publish requires approval)"),
     ("flights-skill", "Flight monitoring and booking (purchase always requires approval)"),
     ("code-assistant-skill", "Code Assistant: read, create, and edit code in the workspace, Copilot-style"),
-    ("automation-skill", "Automation: create/manage scheduled tasks, run commands and Python, notify you"),
-    ("github-skill", "GitHub: read/write repository files, issues, and pull requests"),
+    ("automation-skill", "Automation: create/manage scheduled tasks, run commands and Python, connect to remote servers over SSH, notify you"),
+    ("github-skill", "GitHub: read/write repository files, issues, and pull requests (list, create, merge); list/search your repos (including private); local git commands (clone, pull, push, merge...) in the workspace"),
 ];
 
 /// List the built-in skills available for one-click installation.

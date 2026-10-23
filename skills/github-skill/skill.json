@@ -2,8 +2,8 @@
   "schema_version": "1",
   "id": "github-skill",
   "name": "GitHub",
-  "version": "1.0.0",
-  "description": "Read and write files in repositories, manage issues, and create pull requests through a connected GitHub account (OAuth or token).",
+  "version": "1.1.0",
+  "description": "Read and write files in repositories, manage issues and pull requests (list, create, merge), list/search your repositories (including private), and run local git commands (clone, pull, fetch, push, merge, branch, checkout, commit, log, diff, remote) in the workspace, authenticated with the connected account.",
   "entrypoint": "tools/",
   "implementation_type": "declarative",
   "author": "Auren-AI",
@@ -113,6 +113,267 @@
       "risk_class": "high",
       "implementation_type": "declarative",
       "implementation_ref": "github_create_pr"
+    },
+    {
+      "tool_name": "github_me",
+      "description": "Get the authenticated GitHub user's profile (login, name, email, public repo count).",
+      "input_schema": {
+        "type": "object"
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_me"
+    },
+    {
+      "tool_name": "github_list_repos",
+      "description": "List the authenticated user's repositories, including private ones.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "visibility": { "type": "string", "enum": ["all", "public", "private"], "description": "Default all" },
+          "sort": { "type": "string", "enum": ["updated", "created", "pushed", "full_name"], "description": "Default updated" },
+          "max": { "type": "integer", "description": "Max repos to return (default 30, max 100)" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_list_repos"
+    },
+    {
+      "tool_name": "github_search_repos",
+      "description": "Search repositories by query (public ones, plus private ones the account can access).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "GitHub search query, e.g. 'auren language:rust'" },
+          "max": { "type": "integer", "description": "Max results (default 20, max 100)" }
+        },
+        "required": ["query"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_search_repos"
+    },
+    {
+      "tool_name": "github_list_prs",
+      "description": "List pull requests in a repository.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "state": { "type": "string", "enum": ["open", "closed", "all"], "description": "Default open" }
+        },
+        "required": ["owner", "repo"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_list_prs"
+    },
+    {
+      "tool_name": "github_get_pr",
+      "description": "Get one pull request's details (state, mergeability, author, diff stats).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "number": { "type": "integer", "description": "PR number" }
+        },
+        "required": ["owner", "repo", "number"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_get_pr"
+    },
+    {
+      "tool_name": "github_merge_pr",
+      "description": "Merge a pull request (method: merge, squash, or rebase). High risk: requires approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string" },
+          "repo": { "type": "string" },
+          "number": { "type": "integer", "description": "PR number" },
+          "method": { "type": "string", "enum": ["merge", "squash", "rebase"], "description": "Default merge" }
+        },
+        "required": ["owner", "repo", "number"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "github_merge_pr"
+    },
+    {
+      "tool_name": "git_clone",
+      "description": "Clone a GitHub repository into the workspace ('owner/repo' or https URL). Network operations authenticate with the connected GitHub account.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "repository": { "type": "string", "description": "'owner/repo' or a https://github.com URL" },
+          "destination": { "type": "string", "description": "Workspace folder name; defaults to the repo name" },
+          "branch": { "type": "string" },
+          "depth": { "type": "integer", "description": "Shallow clone depth (optional)" }
+        },
+        "required": ["repository"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_clone"
+    },
+    {
+      "tool_name": "git_status",
+      "description": "Show the working tree status of a repository in the workspace.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Repository folder in the workspace; empty for the root" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_status"
+    },
+    {
+      "tool_name": "git_pull",
+      "description": "Pull (fast-forward only) the latest changes from the remote.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" }
+        }
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_pull"
+    },
+    {
+      "tool_name": "git_fetch",
+      "description": "Fetch all remotes and prune stale branches.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_fetch"
+    },
+    {
+      "tool_name": "git_push",
+      "description": "Push commits to the remote. High risk: requires approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "branch": { "type": "string" },
+          "remote": { "type": "string", "description": "Defaults to origin" }
+        }
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_push"
+    },
+    {
+      "tool_name": "git_merge",
+      "description": "Merge a branch into the current branch.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "branch": { "type": "string", "description": "Branch to merge" }
+        },
+        "required": ["branch"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_merge"
+    },
+    {
+      "tool_name": "git_branch",
+      "description": "List branches, or create one when 'name' is provided.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "name": { "type": "string", "description": "Branch to create; omit to list" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_branch"
+    },
+    {
+      "tool_name": "git_checkout",
+      "description": "Switch to a branch, optionally creating it.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "branch": { "type": "string" },
+          "create": { "type": "boolean", "description": "Create the branch before switching" }
+        },
+        "required": ["branch"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_checkout"
+    },
+    {
+      "tool_name": "git_commit",
+      "description": "Stage changes (git add -A by default) and commit with a message. High risk: requires approval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "message": { "type": "string", "description": "Commit message" },
+          "add_all": { "type": "boolean", "description": "Stage all changes first (default true)" }
+        },
+        "required": ["message"]
+      },
+      "risk_class": "high",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_commit"
+    },
+    {
+      "tool_name": "git_log",
+      "description": "Show recent commit history (one line per commit).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "max_count": { "type": "integer", "description": "Number of commits (default 20, max 100)" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_log"
+    },
+    {
+      "tool_name": "git_diff",
+      "description": "Show a summary of uncommitted changes (diff --stat).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_diff"
+    },
+    {
+      "tool_name": "git_remote",
+      "description": "Show the remotes of a repository in the workspace.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" }
+        }
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "git_remote"
     }
   ]
 }

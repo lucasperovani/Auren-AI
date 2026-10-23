@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{error::ApiError, events::EventEnvelope, state::AppState};
 
 /// How long a pending approval stays valid.
-const APPROVAL_TTL_SECS: i64 = 15 * 60;
+const APPROVAL_TTL_SECS: i64 = 86_400;
 
 pub struct ApprovalService {
     db: SqlitePool,
@@ -36,15 +36,28 @@ impl ApprovalService {
         skill_tool_id: Option<&str>,
         operation: &serde_json::Value,
     ) -> anyhow::Result<String> {
+        self.create_with_conversation(task_run_id, skill_tool_id, None, operation).await
+    }
+
+    /// Create a pending approval request, optionally bound to a chat
+    /// conversation so it can be decided inline in that chat.
+    pub async fn create_with_conversation(
+        &self,
+        task_run_id: Option<&str>,
+        skill_tool_id: Option<&str>,
+        conversation_id: Option<&str>,
+        operation: &serde_json::Value,
+    ) -> anyhow::Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         sqlx::query(
-            "INSERT INTO approval_requests (id, task_run_id, skill_tool_id, operation_hash, operation_json, status, expires_at, created_at)
-             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            "INSERT INTO approval_requests (id, task_run_id, skill_tool_id, conversation_id, operation_hash, operation_json, status, expires_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
         )
         .bind(&id)
         .bind(task_run_id)
         .bind(skill_tool_id)
+        .bind(conversation_id)
         .bind(operation_hash(operation))
         .bind(operation.to_string())
         .bind((now + chrono::Duration::seconds(APPROVAL_TTL_SECS)).to_rfc3339())

@@ -165,6 +165,21 @@ body.sidebar-collapsed .content { margin-left: 0; }
 .nav-link:hover { color: var(--text); background: var(--surface-2); }
 .nav-link.active { color: var(--text); background: var(--surface-2); font-weight: 600; }
 
+/* Pending-approvals badge: red circle with the count inside. */
+.nav-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 5px; margin-left: 8px;
+  border-radius: 9px; background: var(--danger); color: #fff;
+  font-size: 0.72rem; font-weight: 700; line-height: 1;
+  vertical-align: middle;
+}
+.nav-badge.hidden { display: none; }
+
+/* Inline approval actions inside a chat tool-trace card. */
+.approval-inline-actions {
+  display: flex; gap: 8px; margin-top: 8px;
+}
+
 .content {
   margin-left: 200px; padding: 24px; max-width: 1100px;
 }

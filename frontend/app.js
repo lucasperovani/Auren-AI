@@ -130,6 +130,7 @@ async function enterApp() {
   };
   collapseBtn.onclick = () => applyCollapse(!sidebar.classList.contains('collapsed'));
   applyCollapse(sessionStorage.getItem('auren_sidebar_collapsed') === '1');
+  refreshApprovalsBadge();
   navigate(location.hash.replace('#', '') || 'dashboard');
 }
 
@@ -192,10 +193,25 @@ function onLiveEvent(envelope) {
     toast('New notification', 'success');
   } else if (envelope.event_type === 'task_run.approval_required') {
     toast('An operation requires your approval', 'error');
+    refreshApprovalsBadge();
+  } else if (envelope.event_type === 'approval.updated') {
+    refreshApprovalsBadge();
   } else if (envelope.event_type.startsWith('task.')) {
     // Refresh the current view when task state changes.
     navigate(location.hash.replace('#', '') || 'dashboard');
   }
+}
+
+/// Update the red pending-approvals badge next to the sidebar link.
+async function refreshApprovalsBadge() {
+  const badge = document.getElementById('approvals-badge');
+  if (!badge) return;
+  try {
+    const { items } = await api('GET', '/approvals?status=pending&limit=100');
+    const count = items.length;
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.classList.toggle('hidden', count === 0);
+  } catch { /* badge is best-effort */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +305,10 @@ views.chat = async (content) => {
             ${providers.items.flatMap((p) => (chatModels[p.id] || []).map((m) => `<option value="${esc(m.id)}">${esc(p.name)} / ${esc(m.model_name)}</option>`)).join('')}
           </select>
           <button class="btn btn-sm btn-secondary" id="chat-model-save" style="display:none">Save</button>
+          <span class="spacer"></span>
+          <label class="muted" style="font-size:.85rem; display:flex; align-items:center; gap:6px; cursor:pointer" title="Run tool executions in this chat without asking for approval">
+            <input type="checkbox" id="chat-auto-approve"> Auto-approve
+          </label>
         </div>
         <div class="chat-messages" id="chat-messages"></div>
         <div class="chat-input-row">
@@ -320,6 +340,28 @@ views.chat = async (content) => {
       toast('Model saved', 'success');
       saveBtn.style.display = 'none';
     } catch (err) { toast(err.message, 'error'); }
+  });
+
+  // Per-chat auto-approve override (null = follow the global setting).
+  const chatAutoApprove = document.getElementById('chat-auto-approve');
+  if (currentConversationId) {
+    try {
+      const { enabled } = await api('GET', `/conversations/${currentConversationId}/auto-approve`);
+      chatAutoApprove.checked = enabled === true;
+      chatAutoApprove.indeterminate = enabled === null || enabled === undefined;
+    } catch { /* default to global */ }
+  } else {
+    chatAutoApprove.indeterminate = true;
+  }
+  chatAutoApprove.addEventListener('change', async () => {
+    if (!currentConversationId) { toast('Send a message first to start the chat', 'error'); chatAutoApprove.checked = false; return; }
+    try {
+      await api('PUT', `/conversations/${currentConversationId}/auto-approve`, { enabled: chatAutoApprove.checked });
+      toast(chatAutoApprove.checked ? 'Auto-approve on for this chat' : 'Auto-approve off for this chat', 'success');
+    } catch (err) {
+      toast(err.message, 'error');
+      chatAutoApprove.checked = !chatAutoApprove.checked;
+    }
   });
 
   // Conversation switching.
@@ -366,7 +408,10 @@ views.chat = async (content) => {
     if (!currentConversationId) return;
     try {
       const { items } = await api('GET', `/conversations/${currentConversationId}/messages?limit=100`);
-      for (const m of items) addBubble(m.role === 'assistant' ? 'assistant' : 'user', m.content);
+      for (const m of items) {
+        const bubble = addBubble(m.role === 'assistant' ? 'assistant' : 'user', m.content);
+        if (m.tool_trace) addToolTrace(bubble, m.tool_trace);
+      }
     } catch { /* conversation not readable */ }
   };
   await loadHistory();
@@ -708,7 +753,11 @@ views.skills = async (content) => {
           await showSkillVersions(skillId, btn.closest('.card'));
           return;
         }
-        await api('POST', `/skills/${skillId}/${action}`, {});
+        if (action === 'uninstall') {
+          await api('DELETE', `/skills/${skillId}`);
+        } else {
+          await api('POST', `/skills/${skillId}/${action}`, {});
+        }
         toast(`Skill ${action} done`, 'success');
         navigate('skills');
       } catch (err) { toast(err.message, 'error'); }
@@ -812,15 +861,17 @@ views.integrations = async (content) => {
 // ---------------------------------------------------------------------------
 
 views.approvals = async (content) => {
-  const { items } = await api('GET', '/approvals?status=pending');
+  const { items } = await api('GET', '/approvals?status=pending&limit=100');
   content.innerHTML = `
     <h2 class="section-title">Approval inbox</h2>
     ${items.length ? items.map((a) => `
       <div class="card" style="margin-bottom:12px" data-id="${esc(a.id)}">
         <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px">
           <span class="badge ${esc(a.status)}">${esc(a.status)}</span>
+          ${a.tool_name ? `<code>${esc(a.tool_name)}</code>` : ''}
           <span class="muted">expires ${esc(a.expires_at)}</span>
         </div>
+        ${a.args ? `<pre class="tool-trace-params" style="margin:0 0 10px">${esc(JSON.stringify(a.args, null, 2))}</pre>` : ''}
         <div class="form-row" style="flex-direction:row; gap:8px">
           <button class="btn" data-action="approve">Approve</button>
           <button class="btn btn-danger" data-action="reject">Reject</button>
@@ -836,6 +887,7 @@ views.approvals = async (content) => {
         const detail = await api('GET', `/approvals/${approvalId}`);
         await api('POST', `/approvals/${approvalId}/${btn.dataset.action}`, { operation: detail.operation });
         toast(`Approval ${btn.dataset.action}d`, 'success');
+        refreshApprovalsBadge();
         navigate('approvals');
       } catch (err) { toast(err.message, 'error'); }
     });
@@ -847,10 +899,11 @@ views.approvals = async (content) => {
 // ---------------------------------------------------------------------------
 
 views.settings = async (content) => {
-  const [providers, workspaceConfig, agents] = await Promise.all([
+  const [providers, workspaceConfig, agents, autoApprove] = await Promise.all([
     api('GET', '/llm/providers'),
     api('GET', '/workspace/config'),
     api('GET', '/agents'),
+    api('GET', '/workspace/auto-approve'),
   ]);
 
   // Load models for each provider card.
@@ -876,6 +929,15 @@ views.settings = async (content) => {
         </div>
         <div class="muted" style="font-size:.85rem; margin-top:6px; white-space:pre-wrap">${esc(a.instructions || 'No instructions')}</div>
       </div>`).join('')}
+
+    <h2 class="section-title">Executions</h2>
+    <div class="card" style="margin-bottom:16px">
+      <label style="display:flex; align-items:center; gap:10px; cursor:pointer">
+        <input type="checkbox" id="auto-approve-global" ${autoApprove.enabled ? 'checked' : ''}>
+        <span>Run all tool executions without asking for approval</span>
+      </label>
+      <p class="muted" style="margin:8px 0 0; font-size:.85rem">When enabled, the agent executes tools immediately. Critical-risk operations still always ask. You can also override this per chat in the chat toolbar.</p>
+    </div>
 
     <h2 class="section-title">LLM providers</h2>
     <div class="card" style="margin-bottom:16px">
@@ -977,6 +1039,15 @@ views.settings = async (content) => {
       toast('Provider added', 'success');
       navigate('settings');
     } catch (err) { toast(err.message, 'error'); }
+  });
+  document.getElementById('auto-approve-global').addEventListener('change', async (e) => {
+    try {
+      await api('PUT', '/workspace/auto-approve', { enabled: e.target.checked });
+      toast(e.target.checked ? 'Auto-approve enabled' : 'Auto-approve disabled', 'success');
+    } catch (err) {
+      toast(err.message, 'error');
+      e.target.checked = !e.target.checked;
+    }
   });
   // Agent management.
   content.querySelectorAll('.card[data-agent]').forEach((card) => {
@@ -1093,10 +1164,11 @@ function addBubble(role, text) {
   return bubble;
 }
 
-/// Render an expandable tool-call trace under an assistant bubble.
+/// Render an expandable tool-call trace under an assistant bubble. Calls
+/// with status "approval_required" render an inline decision card with the
+/// tool name and arguments, so the user can approve without leaving the chat.
 function addToolTrace(bubble, trace) {
   if (!trace || !trace.length) return;
-  const container = document.getElementById('chat-messages');
   const details = document.createElement('details');
   details.className = 'tool-trace';
   const summary = document.createElement('summary');
@@ -1105,6 +1177,58 @@ function addToolTrace(bubble, trace) {
   for (const call of trace) {
     const item = document.createElement('div');
     item.className = 'tool-trace-item';
+    if (call.status === 'approval_required' && call.approval_id) {
+      item.innerHTML = `<div class="tool-trace-head">⏳ <code>${esc(call.tool)}</code> — waiting for your approval</div>`;
+      const params = document.createElement('pre');
+      params.className = 'tool-trace-params';
+      params.textContent = JSON.stringify(call.arguments, null, 2);
+      item.appendChild(params);
+      const actions = document.createElement('div');
+      actions.className = 'approval-inline-actions';
+      const approve = document.createElement('button');
+      approve.className = 'btn btn-sm';
+      approve.textContent = 'Approve';
+      const reject = document.createElement('button');
+      reject.className = 'btn btn-sm btn-danger';
+      reject.textContent = 'Reject';
+      const decide = async (action) => {
+        approve.disabled = true;
+        reject.disabled = true;
+        try {
+          const detail = await api('GET', `/approvals/${call.approval_id}`);
+          await api('POST', `/approvals/${call.approval_id}/${action}`, { operation: detail.operation });
+          item.querySelector('.tool-trace-head').innerHTML =
+            `${action === 'approve' ? '✓' : '✗'} <code>${esc(call.tool)}</code> — ${action}d`;
+          refreshApprovalsBadge();
+          // The chat exchange stopped at the approval; resuming runs the
+          // approved tool and continues the agent from there.
+          if (action === 'approve' && currentConversationId) {
+            const pending = addBubble('assistant', '…');
+            try {
+              const result = await api('POST', `/conversations/${currentConversationId}/resume`, { approval_id: call.approval_id });
+              pending.remove();
+              const replyBubble = addBubble('assistant', result.reply);
+              if (result.error) replyBubble.classList.add('error-bubble');
+              addToolTrace(replyBubble, result.tool_trace);
+            } catch (err) {
+              pending.textContent = `Error: ${err.message}`;
+              pending.classList.add('error-bubble');
+            }
+          }
+        } catch (err) {
+          toast(err.message, 'error');
+          approve.disabled = false;
+          reject.disabled = false;
+        }
+      };
+      approve.addEventListener('click', () => decide('approve'));
+      reject.addEventListener('click', () => decide('reject'));
+      actions.appendChild(approve);
+      actions.appendChild(reject);
+      item.appendChild(actions);
+      details.appendChild(item);
+      continue;
+    }
     const statusIcon = call.status === 'ok' ? '✓' : '✗';
     item.innerHTML = `<div class="tool-trace-head">${statusIcon} <code>${esc(call.tool)}</code></div>`;
     const params = document.createElement('pre');
@@ -1119,8 +1243,11 @@ function addToolTrace(bubble, trace) {
     }
     details.appendChild(item);
   }
-  container.appendChild(details);
-  container.scrollTop = container.scrollHeight;
+  // The trace belongs to its reply bubble, not to the end of the
+  // transcript: appending to the container made it drift to the bottom
+  // (and duplicate visually) as more messages arrived.
+  bubble.insertAdjacentElement('afterend', details);
+  document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight;
 }
 
 // ---------------------------------------------------------------------------

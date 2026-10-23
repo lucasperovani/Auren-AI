@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_conversations).post(create_conversation))
         .route("/{conversation_id}", get(get_conversation).patch(update_conversation).delete(delete_conversation))
         .route("/{conversation_id}/messages", get(list_messages).post(post_message))
+        .route("/{conversation_id}/resume", post(resume_after_approval))
+        .route("/{conversation_id}/auto-approve", get(get_conversation_auto_approve).put(put_conversation_auto_approve))
 }
 
 #[derive(Deserialize)]
@@ -183,6 +185,68 @@ pub async fn delete_conversation(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Per-conversation auto-approve override: when set, tool executions in this
+/// chat run without approval (critical-risk operations still always ask).
+/// `null`/absent means "follow the global setting".
+async fn conversation_auto_approve(state: &AppState, conversation_id: &str) -> ApiResult<Option<bool>> {
+    let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = ?")
+        .bind(format!("auto_approve:conversation:{conversation_id}"))
+        .fetch_optional(&state.db)
+        .await?;
+    Ok(row.and_then(|r| {
+        let v: String = r.get("value_json");
+        serde_json::from_str::<serde_json::Value>(&v)
+            .ok()
+            .and_then(|v| v.get("enabled").and_then(|v| v.as_bool()))
+    }))
+}
+
+pub async fn get_conversation_auto_approve(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(conversation_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_owned_conversation(&state, &user, &conversation_id).await?;
+    let enabled = conversation_auto_approve(&state, &conversation_id).await?;
+    Ok(Json(json!({ "enabled": enabled })))
+}
+
+#[derive(Deserialize)]
+pub struct ConversationAutoApproveRequest {
+    /// `true`/`false` overrides the global setting; `null` clears it.
+    pub enabled: Option<bool>,
+}
+
+pub async fn put_conversation_auto_approve(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(conversation_id): Path<String>,
+    Json(req): Json<ConversationAutoApproveRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_owned_conversation(&state, &user, &conversation_id).await?;
+    let key = format!("auto_approve:conversation:{conversation_id}");
+    match req.enabled {
+        Some(enabled) => {
+            sqlx::query(
+                "INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            )
+            .bind(&key)
+            .bind(json!({ "enabled": enabled }).to_string())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&state.db)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM app_settings WHERE key = ?")
+                .bind(&key)
+                .execute(&state.db)
+                .await?;
+        }
+    }
+    Ok(Json(json!({ "enabled": req.enabled })))
+}
+
 #[derive(Serialize)]
 pub struct MessageResponse {
     pub id: String,
@@ -190,6 +254,12 @@ pub struct MessageResponse {
     pub role: String,
     pub content: String,
     pub created_at: String,
+    /// SQLite insertion order, used for stable pagination cursors.
+    #[serde(skip)]
+    pub rowid: i64,
+    /// Tool calls made while producing this reply (assistant messages only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_trace: Option<serde_json::Value>,
 }
 
 pub async fn list_messages(
@@ -203,12 +273,12 @@ pub async fn list_messages(
     let cursor = params.cursor.as_deref().and_then(pagination::decode_cursor);
     let rows = match &cursor {
         Some(c) => {
-            sqlx::query("SELECT * FROM messages WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?")
+            sqlx::query("SELECT *, rowid AS msg_rowid FROM messages WHERE conversation_id = ? AND rowid > ? ORDER BY rowid LIMIT ?")
                 .bind(&conversation_id).bind(c).bind(limit + 1)
                 .fetch_all(&state.db).await?
         }
         None => {
-            sqlx::query("SELECT * FROM messages WHERE conversation_id = ? ORDER BY id LIMIT ?")
+            sqlx::query("SELECT *, rowid AS msg_rowid FROM messages WHERE conversation_id = ? ORDER BY rowid LIMIT ?")
                 .bind(&conversation_id).bind(limit + 1)
                 .fetch_all(&state.db).await?
         }
@@ -217,16 +287,22 @@ pub async fn list_messages(
     let items: Vec<MessageResponse> = rows
         .iter()
         .take(limit as usize)
-        .map(|r| MessageResponse {
-            id: r.get("id"),
-            conversation_id: r.get("conversation_id"),
-            role: r.get("role"),
-            content: r.get("content"),
-            created_at: r.get("created_at"),
+        .map(|r| {
+            let metadata: String = r.try_get("metadata_json").unwrap_or_else(|_| "{}".into());
+            let metadata = serde_json::from_str::<serde_json::Value>(&metadata).unwrap_or(json!({}));
+            MessageResponse {
+                id: r.get("id"),
+                conversation_id: r.get("conversation_id"),
+                role: r.get("role"),
+                content: r.get("content"),
+                created_at: r.get("created_at"),
+                rowid: r.get("msg_rowid"),
+                tool_trace: metadata.get("tool_trace").and_then(|v| if v.is_null() { None } else { Some(v.clone()) }),
+            }
         })
         .collect();
     let next_cursor = if has_more {
-        items.last().map(|m| pagination::encode_cursor(&m.id))
+        items.last().map(|m| pagination::encode_cursor(&m.rowid.to_string()))
     } else {
         None
     };
@@ -304,12 +380,15 @@ pub async fn post_message(
         }
     };
 
-    // Persist the assistant reply.
+    // Persist the assistant reply with the tool-call trace so it survives
+    // history reloads (the frontend renders it under the reply bubble).
     let assistant_message_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
+    let tool_trace = runtime.last_tool_trace.lock().expect("trace poisoned").clone();
+    sqlx::query("INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)")
         .bind(&assistant_message_id)
         .bind(&conversation_id)
         .bind(&reply)
+        .bind(json!({ "tool_trace": tool_trace }).to_string())
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&state.db)
         .await?;
@@ -334,7 +413,7 @@ pub async fn post_message(
     }
 
     // Collect the tool calls made during this exchange for the activity
-    // trace shown in the frontend.
+    // trace shown in the frontend (already persisted with the reply).
     let tool_trace = runtime.last_tool_trace.lock().expect("trace poisoned").clone();
 
     Ok((
@@ -346,4 +425,69 @@ pub async fn post_message(
             "tool_trace": tool_trace,
         })),
     ))
+}
+
+/// Continue a chat exchange after the user approved a pending tool call.
+/// Runs the approved operation, feeds the result to the LLM, and returns
+/// the final answer (persisted like any assistant reply).
+#[derive(Deserialize)]
+pub struct ResumeRequest {
+    pub approval_id: String,
+}
+
+pub async fn resume_after_approval(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(conversation_id): Path<String>,
+    Json(req): Json<ResumeRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_owned_conversation(&state, &user, &conversation_id).await?;
+    let agent_id: String = sqlx::query("SELECT agent_id FROM conversations WHERE id = ?")
+        .bind(&conversation_id)
+        .fetch_one(&state.db)
+        .await?
+        .get("agent_id");
+
+    let runtime = crate::services::agent_runtime::AgentRuntime::new(state.clone());
+    let reply = match runtime.resume_chat(&agent_id, &conversation_id, &req.approval_id).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            let error_text = format!("The agent could not resume: {e}");
+            let error_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
+                .bind(&error_id)
+                .bind(&conversation_id)
+                .bind(&error_text)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&state.db)
+                .await?;
+            return Ok(Json(json!({
+                "assistant_message_id": error_id,
+                "reply": error_text,
+                "error": true,
+            })));
+        }
+    };
+
+    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+    let tool_trace = runtime.last_tool_trace.lock().expect("trace poisoned").clone();
+    sqlx::query("INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)")
+        .bind(&assistant_message_id)
+        .bind(&conversation_id)
+        .bind(&reply)
+        .bind(json!({ "tool_trace": tool_trace }).to_string())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.db)
+        .await?;
+    sqlx::query("UPDATE conversations SET updated_at = ? WHERE id = ?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&conversation_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(json!({
+        "assistant_message_id": assistant_message_id,
+        "reply": reply,
+        "tool_trace": tool_trace,
+    })))
 }

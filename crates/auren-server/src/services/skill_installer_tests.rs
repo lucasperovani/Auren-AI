@@ -105,12 +105,13 @@ async fn installs_valid_package() {
     assert_eq!(row.get::<String, _>("status"), "installed");
     assert_eq!(row.get::<String, _>("skill_id"), "gmail-monitor");
 
-    // Skill registered with active version and tool.
+    // Skill registered with active version, tool, and enabled for the
+    // installer's agents (a freshly installed skill is usable immediately).
     let skill = sqlx::query("SELECT status, active_version_id FROM skills WHERE id = 'gmail-monitor'")
         .fetch_one(&s.db)
         .await
         .unwrap();
-    assert_eq!(skill.get::<String, _>("status"), "disabled");
+    assert_eq!(skill.get::<String, _>("status"), "enabled");
     assert!(skill.get::<Option<String>, _>("active_version_id").is_some());
     let tools = sqlx::query("SELECT COUNT(*) AS c FROM skill_tools")
         .fetch_one(&s.db)

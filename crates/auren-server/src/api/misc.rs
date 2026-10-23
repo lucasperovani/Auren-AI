@@ -295,6 +295,7 @@ pub async fn delete_notification(
 pub fn workspace_router() -> Router<AppState> {
     Router::new()
         .route("/config", get(get_workspace_config).patch(update_workspace_config))
+        .route("/auto-approve", get(get_auto_approve).put(update_auto_approve))
         .route("/files", get(list_files).delete(delete_file))
         .route("/files/content", get(read_file).put(write_file))
 }
@@ -365,6 +366,47 @@ pub async fn update_workspace_config(
     .execute(&state.db)
     .await?;
     Ok(Json(req.config))
+}
+
+/// Global auto-approve setting: when enabled, tool executions run without
+/// user approval (critical-risk operations still always ask).
+pub async fn get_auto_approve(
+    State(state): State<AppState>,
+    _user: AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'auto_approve'")
+        .fetch_optional(&state.db)
+        .await?;
+    let enabled = row
+        .and_then(|r| {
+            let v: String = r.get("value_json");
+            serde_json::from_str::<serde_json::Value>(&v)
+                .ok()
+                .and_then(|v| v.get("enabled").and_then(|v| v.as_bool()))
+        })
+        .unwrap_or(false);
+    Ok(Json(json!({ "enabled": enabled })))
+}
+
+#[derive(Deserialize)]
+pub struct AutoApproveRequest {
+    pub enabled: bool,
+}
+
+pub async fn update_auto_approve(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Json(req): Json<AutoApproveRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value_json, updated_at) VALUES ('auto_approve', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+    )
+    .bind(json!({ "enabled": req.enabled }).to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.db)
+    .await?;
+    Ok(Json(json!({ "enabled": req.enabled })))
 }
 
 #[derive(Deserialize)]

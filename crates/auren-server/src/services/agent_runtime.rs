@@ -4,7 +4,7 @@
 //! each requested action through the permission engine, executes tools, and
 //! persists state after every transition. Limits prevent unbounded loops.
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::{
@@ -292,7 +292,7 @@ impl AgentRuntime {
             .collect()
     }
 
-    async fn resolve_tool(&self, agent_id: &str, tool_name: &str) -> Option<String> {
+        async fn resolve_tool(&self, agent_id: &str, tool_name: &str) -> Option<String> {
         let row = sqlx::query(
             "SELECT st.id FROM skill_tools st
              JOIN agent_skills ask ON ask.skill_version_id = st.skill_version_id
@@ -341,9 +341,11 @@ impl AgentRuntime {
             .unwrap_or_default();
 
         // Build the message list from the conversation history (last 40
-        // messages) plus the new user message.
+        // messages) plus the new user message. Insertion order (rowid) is
+        // the only reliable ordering: ids are random UUIDs and created_at
+        // can tie within the same exchange.
         let history = sqlx::query(
-            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 40",
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY rowid DESC LIMIT 40",
         )
         .bind(conversation_id)
         .fetch_all(&self.state.db)
@@ -418,7 +420,7 @@ impl AgentRuntime {
                     continue;
                 };
 
-                match self.tools.authorize(agent_id, &tool_id, &call.arguments, None).await {
+                match self.tools.authorize_in_conversation(agent_id, &tool_id, &call.arguments, None, Some(conversation_id)).await {
                     Ok(Authorization::Allowed) => {
                         let result = self.tools.invoke_chat(agent_id, &tool_id, &call.arguments).await;
                         if let Err(e) = &result {
@@ -442,10 +444,225 @@ impl AgentRuntime {
                             tool_call_id: Some(call.id.clone()),
                         });
                     }
-                    Ok(Authorization::RequiresApproval { .. }) => {
+                    Ok(Authorization::RequiresApproval { approval_id }) => {
+                        // Record the pending approval in the trace so the
+                        // frontend can render an inline decision card. The
+                        // exchange ends here: the HTTP response returns right
+                        // away (blocking it for hours would only get the
+                        // connection killed), and when the user approves, the
+                        // frontend resends the message and this loop runs
+                        // again — the approved operation is then executed
+                        // directly by the authorization check below.
+                        self.last_tool_trace.lock().expect("trace poisoned").push(json!({
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "status": "approval_required",
+                            "approval_id": approval_id,
+                        }));
                         messages.push(LlmMessage {
                             role: "tool".into(),
-                            content: "this operation requires user approval; tell the user to approve it in the Approvals view, then try again".into(),
+                            content: "this operation requires user approval; the request is pending in this chat and in the Approvals view. Ask the user to approve it, then try again".into(),
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                    Ok(Authorization::Denied(reason)) => {
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content: format!("denied: {reason}"),
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                    Err(e) => {
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content: format!("authorization error: {e}"),
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        Err("the assistant used too many tool calls without reaching an answer".into())
+    }
+
+    /// Resume a chat exchange after the user approved a pending tool call.
+    /// Executes the approved operation, feeds the result to the LLM with the
+    /// conversation history, and continues the bounded loop to the final
+    /// answer. The approval is verified (status + operation hash) before
+    /// anything runs.
+    pub async fn resume_chat(
+        &self,
+        agent_id: &str,
+        conversation_id: &str,
+        approval_id: &str,
+    ) -> Result<String, String> {
+        let provider = self
+            .build_provider(agent_id)
+            .await
+            .ok_or_else(|| "no LLM provider configured for this agent. Add one in Settings, then select it for the agent.".to_string())?;
+
+        // Load the approved operation and verify it is really approved.
+        let row = sqlx::query("SELECT skill_tool_id, operation_json FROM approval_requests WHERE id = ?")
+            .bind(approval_id)
+            .fetch_optional(&self.state.db)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "approval not found".to_string())?;
+        let skill_tool_id: String = row.get("skill_tool_id");
+        let operation: Value = serde_json::from_str(row.get::<String, _>("operation_json").as_str())
+            .map_err(|_| "invalid stored operation".to_string())?;
+        let args = operation.get("args").cloned().unwrap_or(json!({}));
+        let tool_name = operation.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // The approval must still be valid (defense in depth: status and
+        // hash of the exact operation being executed).
+        self.tools
+            .approvals
+            .revalidate(approval_id, &operation)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Execute the approved tool and record it in the trace.
+        let result = self.tools.invoke_chat(agent_id, &skill_tool_id, &args).await;
+        if let Err(e) = &result {
+            tracing::warn!(tool = %tool_name, error = %e, "resumed tool invocation failed");
+        }
+        self.last_tool_trace.lock().expect("trace poisoned").push(json!({
+            "tool": tool_name,
+            "arguments": args,
+            "status": if result.is_ok() { "ok" } else { "error" },
+            "error": result.as_ref().err().map(|e| e.to_string()),
+        }));
+        let tool_content = match result {
+            Ok(value) => value.to_string(),
+            Err(e) => format!("tool error: {e}"),
+        };
+
+        // Rebuild the conversation context: system + history + the pending
+        // assistant tool-call request + the tool result, then continue the
+        // bounded loop.
+        let instructions: String = sqlx::query("SELECT instructions FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_optional(&self.state.db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_get::<String, _>("instructions").ok())
+            .unwrap_or_default();
+        let history = sqlx::query(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY rowid DESC LIMIT 40",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.state.db)
+        .await
+        .unwrap_or_default();
+
+        let mut messages = vec![LlmMessage {
+            role: "system".into(),
+            content: format!(
+                "{instructions}\n\nYou are a personal assistant in a chat conversation. \
+                 Answer the user's questions directly. You may use the available tools when \
+                 they help answer (reading workspace files, web research, connected \
+                 integrations). Do not create tasks unless the user explicitly asks you to \
+                 schedule or automate something; in that case, describe what you would set \
+                 up and ask for confirmation first."
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        for row in history.iter().rev() {
+            let role: String = row.get("role");
+            let content: String = row.get("content");
+            if role == "user" || role == "assistant" {
+                messages.push(LlmMessage { role, content, tool_calls: None, tool_call_id: None });
+            }
+        }
+        // The assistant's tool-call request that was awaiting approval, and
+        // its result — so the model sees a consistent tool-use transcript.
+        messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![crate::services::llm::LlmToolCall {
+                id: format!("resume_{approval_id}"),
+                name: tool_name.clone(),
+                arguments: args.clone(),
+            }]),
+            tool_call_id: None,
+        });
+        messages.push(LlmMessage {
+            role: "tool".into(),
+            content: tool_content,
+            tool_calls: None,
+            tool_call_id: Some(format!("resume_{approval_id}")),
+        });
+
+        let available_tools = self.available_tools(agent_id).await;
+        let mut tool_calls_made: u32 = 0;
+        for _iteration in 0..8 {
+            let completion = provider
+                .complete(&messages, &available_tools, None)
+                .await
+                .map_err(|e| format!("LLM request failed: {e}"))?;
+            if completion.tool_calls.is_empty() {
+                if completion.content.trim().is_empty() {
+                    return Err("the model returned an empty response".into());
+                }
+                return Ok(completion.content);
+            }
+            messages.push(LlmMessage {
+                role: "assistant".into(),
+                content: completion.content.clone(),
+                tool_calls: Some(completion.tool_calls.clone()),
+                tool_call_id: None,
+            });
+            for call in &completion.tool_calls {
+                if tool_calls_made >= 10 {
+                    return Ok(completion.content);
+                }
+                tool_calls_made += 1;
+                let tool_id = self.resolve_tool(agent_id, &call.name).await;
+                let Some(tool_id) = tool_id else {
+                    messages.push(LlmMessage {
+                        role: "tool".into(),
+                        content: format!("tool '{}' is not available to this agent", call.name),
+                        tool_calls: None,
+                        tool_call_id: Some(call.id.clone()),
+                    });
+                    continue;
+                };
+                match self.tools.authorize_in_conversation(agent_id, &tool_id, &call.arguments, None, Some(conversation_id)).await {
+                    Ok(Authorization::Allowed) => {
+                        let result = self.tools.invoke_chat(agent_id, &tool_id, &call.arguments).await;
+                        self.last_tool_trace.lock().expect("trace poisoned").push(json!({
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "status": if result.is_ok() { "ok" } else { "error" },
+                            "error": result.as_ref().err().map(|e| e.to_string()),
+                        }));
+                        let content = match result {
+                            Ok(value) => value.to_string(),
+                            Err(e) => format!("tool error: {e}"),
+                        };
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content,
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                    }
+                    Ok(Authorization::RequiresApproval { approval_id }) => {
+                        self.last_tool_trace.lock().expect("trace poisoned").push(json!({
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "status": "approval_required",
+                            "approval_id": approval_id,
+                        }));
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content: "this operation requires user approval; the request is pending in this chat and in the Approvals view. Ask the user to approve it, then try again".into(),
                             tool_calls: None,
                             tool_call_id: Some(call.id.clone()),
                         });

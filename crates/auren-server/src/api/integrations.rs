@@ -37,7 +37,7 @@ const CATALOG: &[(&str, &[&str])] = &[
     ("gphotos", &["list_albums", "search_media", "get_media"]),
     ("instagram", &["get_account_info", "list_media", "publish_media"]),
     ("flights", &["search_itineraries", "get_price", "monitor_price", "prepare_booking", "complete_purchase"]),
-    ("github", &["list_files", "read_file", "write_file", "list_issues", "create_issue", "create_pr"]),
+    ("github", &["list_files", "read_file", "write_file", "list_issues", "create_issue", "create_pr", "me", "list_repos", "search_repos", "list_prs", "get_pr", "merge_pr", "git_clone", "git_pull", "git_fetch", "git_push"]),
 ];
 
 pub async fn catalog() -> Json<serde_json::Value> {

@@ -16,7 +16,7 @@ const ALWAYS_ASK_RISK_CLASSES: [&str; 2] = ["high", "critical"];
 pub struct ToolRegistry {
     db: SqlitePool,
     state: AppState,
-    approvals: super::approvals::ApprovalService,
+    pub(crate) approvals: super::approvals::ApprovalService,
 }
 
 /// The authorization outcome for a tool invocation.
@@ -55,10 +55,27 @@ impl ToolRegistry {
         args: &Value,
         integration_account_id: Option<&str>,
     ) -> Result<Authorization, ApiError> {
+        self.authorize_in_conversation(agent_id, skill_tool_id, args, integration_account_id, None)
+            .await
+    }
+
+    /// Authorize a tool invocation in a chat conversation. The conversation
+    /// enables the per-chat auto-approve setting and binds any approval
+    /// request to the chat so it can be decided inline.
+    pub async fn authorize_in_conversation(
+        &self,
+        agent_id: &str,
+        skill_tool_id: &str,
+        args: &Value,
+        integration_account_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<Authorization, ApiError> {
         // 1. Tool must exist and belong to a skill version enabled for the agent.
         let tool = sqlx::query(
-            "SELECT st.tool_name, st.risk_class, st.implementation_type, st.implementation_ref, st.input_schema_json
+            "SELECT st.tool_name, st.risk_class, st.implementation_type, st.implementation_ref, st.input_schema_json,
+                    sv.manifest_json
              FROM skill_tools st
+             JOIN skill_versions sv ON sv.id = st.skill_version_id
              JOIN agent_skills ask ON ask.skill_version_id = st.skill_version_id
              WHERE st.id = ? AND ask.agent_id = ? AND ask.enabled = 1",
         )
@@ -77,6 +94,53 @@ impl ToolRegistry {
                 "unsupported implementation type '{implementation_type}'"
             )));
         }
+
+        // 1b. Skills that require an integration get the owner's active
+        // account resolved automatically when the caller did not pass one:
+        // the agent has no way to know account ids, so requiring it in the
+        // arguments would make every integration tool unusable in chat.
+        let integration_account_id = match integration_account_id {
+            Some(id) => Some(id.to_string()),
+            None => {
+                let manifest: String = tool.get("manifest_json");
+                let providers = serde_json::from_str::<serde_json::Value>(&manifest)
+                    .ok()
+                    .and_then(|m| {
+                        m.get("required_integrations")
+                            .and_then(|v| v.as_array().cloned())
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>();
+                match providers.first() {
+                    Some(provider) => {
+                        let account: Option<String> = sqlx::query(
+                            "SELECT a.id FROM integration_accounts a
+                             JOIN integrations i ON i.id = a.integration_id
+                             JOIN agents ag ON ag.user_id = i.user_id
+                             WHERE ag.id = ? AND i.provider_type = ? AND i.status = 'connected' AND a.status = 'active'
+                             ORDER BY a.created_at LIMIT 1",
+                        )
+                        .bind(agent_id)
+                        .bind(provider)
+                        .fetch_optional(&self.db)
+                        .await?
+                        .and_then(|r| r.try_get("id").ok());
+                        match account {
+                            Some(id) => Some(id),
+                            None => {
+                                return Ok(Authorization::Denied(format!(
+                                    "this tool needs a connected {provider} account; connect it in the Integrations view"
+                                )));
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            }
+        };
+        let integration_account_id = integration_account_id.as_deref();
 
         // 2. Agent-level policy.
         let policy: Option<String> = sqlx::query(
@@ -102,6 +166,13 @@ impl ToolRegistry {
         }
 
         if needs_approval {
+            // Auto-approve settings: a per-conversation override wins over
+            // the global setting. "critical" risk always asks regardless.
+            let auto_approved = risk_class != "critical"
+                && self.auto_approve(conversation_id).await;
+            if auto_approved {
+                return Ok(Authorization::Allowed);
+            }
             let operation = json!({
                 "agent_id": agent_id,
                 "skill_tool_id": skill_tool_id,
@@ -109,14 +180,69 @@ impl ToolRegistry {
                 "args": args,
                 "integration_account_id": integration_account_id,
             });
+            // A prior approval for this exact operation (same hash) lets the
+            // call through: the user already decided it, and the runtime
+            // retries the tool after the approval instead of blocking the
+            // chat exchange for hours.
+            let approved = sqlx::query(
+                "SELECT id FROM approval_requests
+                 WHERE skill_tool_id = ? AND operation_hash = ? AND status = 'approved' AND expires_at > ?
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(skill_tool_id)
+            .bind(crate::services::approvals::operation_hash(&operation))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .fetch_optional(&self.db)
+            .await?;
+            if approved.is_some() {
+                return Ok(Authorization::Allowed);
+            }
             let approval_id = self
                 .approvals
-                .create(None, Some(skill_tool_id), &operation)
+                .create_with_conversation(None, Some(skill_tool_id), conversation_id, &operation)
                 .await
                 .map_err(ApiError::from)?;
             return Ok(Authorization::RequiresApproval { approval_id });
         }
         Ok(Authorization::Allowed)
+    }
+
+    /// Whether tool executions in this context run without approval: the
+    /// per-conversation setting wins; otherwise the global setting applies.
+    async fn auto_approve(&self, conversation_id: Option<&str>) -> bool {
+        if let Some(conversation_id) = conversation_id {
+            let row = sqlx::query(
+                "SELECT value_json FROM app_settings WHERE key = ?",
+            )
+            .bind(format!("auto_approve:conversation:{conversation_id}"))
+            .fetch_optional(&self.db)
+            .await
+            .ok()
+            .flatten();
+            if let Some(row) = row {
+                let raw: String = row.get("value_json");
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
+                        return enabled;
+                    }
+                }
+            }
+        }
+        let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = 'auto_approve'")
+            .fetch_optional(&self.db)
+            .await
+            .ok()
+            .flatten();
+        match row {
+            Some(row) => {
+                let raw: String = row.get("value_json");
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|v| v.get("enabled").and_then(|v| v.as_bool()))
+                    .unwrap_or(false)
+            }
+            None => false,
+        }
     }
 
     /// Verify the connected account's granted scopes cover the operation.
@@ -206,12 +332,63 @@ impl ToolRegistry {
     /// call is audited but not recorded as a task step.
     pub async fn invoke_chat(
         &self,
-        _agent_id: &str,
+        agent_id: &str,
         skill_tool_id: &str,
         args: &Value,
     ) -> Result<Value, ApiError> {
-        let account_id = args.get("integration_account_id").and_then(|v| v.as_str());
-        self.execute_declarative_with_account(skill_tool_id, args, account_id).await
+        let account_id = match args.get("integration_account_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => Some(id.to_string()),
+            _ => self.resolve_skill_account(agent_id, skill_tool_id).await?,
+        };
+        let args = if account_id.is_some() && args.get("integration_account_id").is_none() {
+            let mut args = args.clone();
+            args["integration_account_id"] = json!(account_id);
+            args
+        } else {
+            args.clone()
+        };
+        self.execute_declarative_with_account(skill_tool_id, &args, account_id.as_deref()).await
+    }
+
+    /// Resolve the skill owner's active account for the skill's required
+    /// integration (first provider in `required_integrations`).
+    async fn resolve_skill_account(
+        &self,
+        agent_id: &str,
+        skill_tool_id: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let row = sqlx::query(
+            "SELECT sv.manifest_json FROM skill_tools st
+             JOIN skill_versions sv ON sv.id = st.skill_version_id
+             WHERE st.id = ?",
+        )
+        .bind(skill_tool_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+        let manifest: String = row.get("manifest_json");
+        let provider = serde_json::from_str::<serde_json::Value>(&manifest)
+            .ok()
+            .and_then(|m| {
+                m.get("required_integrations")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+            });
+        let Some(provider) = provider else { return Ok(None) };
+        let account: Option<String> = sqlx::query(
+            "SELECT a.id FROM integration_accounts a
+             JOIN integrations i ON i.id = a.integration_id
+             JOIN agents ag ON ag.user_id = i.user_id
+             WHERE ag.id = ? AND i.provider_type = ? AND i.status = 'connected' AND a.status = 'active'
+             ORDER BY a.created_at LIMIT 1",
+        )
+        .bind(agent_id)
+        .bind(&provider)
+        .fetch_optional(&self.db)
+        .await?
+        .and_then(|r| r.try_get("id").ok());
+        Ok(account)
     }
 
     /// Resolve and run the builtin implementation behind a declarative tool.
@@ -265,22 +442,31 @@ impl ToolRegistry {
         }
 
         // Integration tools dispatch to the integration modules; they need
-        // the connected account passed in the arguments.
+        // the connected account passed in the arguments. Tools whose
+        // implementation is a registered builtin (github_*, git_*) are NOT
+        // integration dispatches: the builtin itself consumes the account
+        // from the arguments, so they fall through to the builtin path.
         if let Some(account_id) = account_id {
-            let provider_type: String = sqlx::query("SELECT provider_type FROM integrations WHERE id = (SELECT integration_id FROM integration_accounts WHERE id = ?)")
-                .bind(account_id)
-                .fetch_optional(&self.db)
-                .await?
-                .ok_or(ApiError::NotFound)?
-                .try_get("provider_type")?;
-            return super::integrations::execute_integration_tool(
-                &self.state,
-                &provider_type,
-                &reference,
-                args,
-                account_id,
-            )
-            .await;
+            let is_builtin_ref = reference.starts_with("builtin.")
+                || super::skill_installer::KNOWN_BUILTINS
+                    .iter()
+                    .any(|k| k.strip_prefix("builtin.") == Some(reference.as_str()));
+            if !is_builtin_ref {
+                let provider_type: String = sqlx::query("SELECT provider_type FROM integrations WHERE id = (SELECT integration_id FROM integration_accounts WHERE id = ?)")
+                    .bind(account_id)
+                    .fetch_optional(&self.db)
+                    .await?
+                    .ok_or(ApiError::NotFound)?
+                    .try_get("provider_type")?;
+                return super::integrations::execute_integration_tool(
+                    &self.state,
+                    &provider_type,
+                    &reference,
+                    args,
+                    account_id,
+                )
+                .await;
+            }
         }
 
         // Normalize the bare form ("code_write_file") to the namespaced
@@ -370,6 +556,53 @@ mod tests {
             Authorization::RequiresApproval { .. } => {}
             other => panic!("expected approval, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn global_auto_approve_skips_approval() {
+        let s = state().await;
+        let tool = seed(&s, "high", None).await;
+        sqlx::query("INSERT INTO app_settings (key, value_json, updated_at) VALUES ('auto_approve', '{\"enabled\":true}', '2026')")
+            .execute(&s.db).await.unwrap();
+        let reg = ToolRegistry::new(&s);
+        assert!(matches!(reg.authorize("ag1", &tool, &json!({}), None).await.unwrap(), Authorization::Allowed));
+    }
+
+    #[tokio::test]
+    async fn critical_risk_always_asks_even_with_auto_approve() {
+        let s = state().await;
+        let tool = seed(&s, "critical", None).await;
+        sqlx::query("INSERT INTO conversations (id, user_id, agent_id, title, status, created_at, updated_at) VALUES ('c1','u1','ag1','T','active','2026','2026')")
+            .execute(&s.db).await.unwrap();
+        sqlx::query("INSERT INTO app_settings (key, value_json, updated_at) VALUES ('auto_approve', '{\"enabled\":true}', '2026')")
+            .execute(&s.db).await.unwrap();
+        let reg = ToolRegistry::new(&s);
+        assert!(matches!(
+            reg.authorize_in_conversation("ag1", &tool, &json!({}), None, Some("c1")).await.unwrap(),
+            Authorization::RequiresApproval { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_created_in_conversation_is_bound_to_it() {
+        let s = state().await;
+        let tool = seed(&s, "high", None).await;
+        sqlx::query("INSERT INTO conversations (id, user_id, agent_id, title, status, created_at, updated_at) VALUES ('c1','u1','ag1','T','active','2026','2026')")
+            .execute(&s.db).await.unwrap();
+        let reg = ToolRegistry::new(&s);
+        let approval_id = match reg.authorize_in_conversation("ag1", &tool, &json!({}), None, Some("c1")).await.unwrap() {
+            Authorization::RequiresApproval { approval_id } => approval_id,
+            other => panic!("expected approval, got {other:?}"),
+        };
+        let conversation_id: Option<String> =
+            sqlx::query("SELECT conversation_id FROM approval_requests WHERE id = ?")
+                .bind(&approval_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap()
+                .try_get("conversation_id")
+                .unwrap();
+        assert_eq!(conversation_id.as_deref(), Some("c1"));
     }
 
     #[tokio::test]

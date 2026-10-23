@@ -70,6 +70,19 @@ async fn get_json(app: &axum::Router, uri: &str, token: Option<&str>) -> (Status
     json_response(response).await
 }
 
+async fn put_json(app: &axum::Router, uri: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method("PUT").uri(uri);
+    if let Some(t) = token {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.header("content-type", "application/json").body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    json_response(response).await
+}
+
 /// Setup admin and log in; returns the session token.
 async fn setup_and_login(app: &axum::Router) -> String {
     let (status, _) = post_json(
@@ -296,6 +309,104 @@ async fn approval_flow_end_to_end() {
     // And fails for a changed operation.
     let changed = json!({ "tool": "gmail.send", "args": { "to": "other@y.com" } });
     assert!(svc.revalidate(&approval_id, &changed).await.is_err());
+}
+
+#[tokio::test]
+async fn chat_approval_is_visible_and_decidable_by_conversation_owner() {
+    let (app, state, _d) = app().await;
+    let token = setup_and_login(&app).await;
+
+    // Agent and conversation owned by the admin user.
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let (status, conversation) = post_json(
+        &app,
+        "/api/v1/conversations",
+        Some(&token),
+        json!({ "agent_id": agent_id, "title": "t" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let conversation_id = conversation["id"].as_str().unwrap().to_string();
+
+    // A chat approval bound to the conversation (as the runtime creates it).
+    let svc = crate::services::approvals::ApprovalService::new(&state);
+    let operation = json!({ "agent_id": agent_id, "tool_name": "git_push", "args": {} });
+    let approval_id = svc
+        .create_with_conversation(None, None, Some(&conversation_id), &operation)
+        .await
+        .unwrap();
+
+    // The pending list shows the tool name and arguments.
+    let (status, list) = get_json(&app, "/api/v1/approvals?status=pending", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = list["items"].as_array().unwrap().iter().find(|i| i["id"] == approval_id).unwrap().clone();
+    assert_eq!(item["tool_name"], "git_push");
+    assert_eq!(item["conversation_id"], conversation_id);
+
+    // The conversation owner can read the full operation.
+    let (status, detail) = get_json(&app, &format!("/api/v1/approvals/{approval_id}"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["operation"]["tool_name"], "git_push");
+
+    // And decide it inline.
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/approvals/{approval_id}/approve"),
+        Some(&token),
+        json!({ "operation": operation }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    svc.revalidate(&approval_id, &operation).await.unwrap();
+}
+
+#[tokio::test]
+async fn auto_approve_settings_roundtrip() {
+    let (app, _s, _d) = app().await;
+    let token = setup_and_login(&app).await;
+
+    // Default is off.
+    let (_, body) = get_json(&app, "/api/v1/workspace/auto-approve", Some(&token)).await;
+    assert_eq!(body["enabled"], false);
+
+    // Enable globally.
+    let (status, _) = put_json(&app, "/api/v1/workspace/auto-approve", Some(&token), json!({ "enabled": true })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get_json(&app, "/api/v1/workspace/auto-approve", Some(&token)).await;
+    assert_eq!(body["enabled"], true);
+
+    // Per-conversation override.
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let (_, conversation) = post_json(
+        &app,
+        "/api/v1/conversations",
+        Some(&token),
+        json!({ "agent_id": agent["id"], "title": "t" }),
+    )
+    .await;
+    let conversation_id = conversation["id"].as_str().unwrap();
+    let (status, _) = put_json(
+        &app,
+        &format!("/api/v1/conversations/{conversation_id}/auto-approve"),
+        Some(&token),
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get_json(&app, &format!("/api/v1/conversations/{conversation_id}/auto-approve"), Some(&token)).await;
+    assert_eq!(body["enabled"], false);
+    // Clearing the override returns null (follow global).
+    let (status, _) = put_json(
+        &app,
+        &format!("/api/v1/conversations/{conversation_id}/auto-approve"),
+        Some(&token),
+        json!({ "enabled": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get_json(&app, &format!("/api/v1/conversations/{conversation_id}/auto-approve"), Some(&token)).await;
+    assert!(body["enabled"].is_null());
 }
 
 #[tokio::test]

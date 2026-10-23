@@ -308,6 +308,25 @@ paths:
       responses:
         "202":
           description: Processing accepted
+  /conversations/{conversation_id}/resume:
+    post:
+      tags: [Conversations]
+      summary: Continue a chat exchange after approving a pending tool call
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approval_id]
+              properties:
+                approval_id:
+                  type: string
+      responses:
+        "200":
+          description: Agent's continued reply with the tool trace
   /tasks:
     get:
       tags: [Tasks]
@@ -912,6 +931,36 @@ paths:
       responses:
         "200":
           description: Approval cancelled
+  /workspace/auto-approve:
+    get:
+      tags: [Approvals]
+      summary: Read the global auto-approve setting
+      responses:
+        "200":
+          description: Current setting
+    put:
+      tags: [Approvals]
+      summary: Enable or disable global auto-approve
+      responses:
+        "200":
+          description: Setting updated
+  /conversations/{conversation_id}/auto-approve:
+    get:
+      tags: [Approvals]
+      summary: Read the per-chat auto-approve override
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Override value (null follows the global setting)
+    put:
+      tags: [Approvals]
+      summary: Set or clear the per-chat auto-approve override
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Override updated
   /memories:
     get:
       tags: [Memory]

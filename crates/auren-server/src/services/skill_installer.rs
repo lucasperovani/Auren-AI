@@ -186,7 +186,37 @@ impl SkillInstallationService {
             "skill.installed",
             json!({ "upload_id": upload_id, "skill_id": manifest.id, "version": manifest.version }),
         ));
+        // Enable the skill and link it to the installer's agents so chat
+        // and tasks can use it immediately (a freshly installed skill that
+        // no agent can see looks broken to the user).
+        self.enable_for_user_agents(user_id, &manifest.id).await?;
         Ok(upload_id)
+    }
+
+    /// Enable the skill row and link its active version to every agent
+    /// owned by the installing user (idempotent).
+    async fn enable_for_user_agents(&self, user_id: &str, skill_id: &str) -> Result<(), ApiError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("UPDATE skills SET status = 'enabled', updated_at = ? WHERE id = ? AND active_version_id IS NOT NULL")
+            .bind(&now)
+            .bind(skill_id)
+            .execute(&self.db)
+            .await?;
+        let result = sqlx::query(
+            "INSERT INTO agent_skills (id, agent_id, skill_version_id, enabled, installed_at)
+             SELECT ?, a.id, s.active_version_id, 1, ?
+             FROM agents a JOIN skills s ON s.id = ?
+             WHERE a.user_id = ? AND s.active_version_id IS NOT NULL
+             ON CONFLICT(agent_id, skill_version_id) DO UPDATE SET enabled = 1",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&now)
+        .bind(skill_id)
+        .bind(user_id)
+        .execute(&self.db)
+        .await?;
+        let _ = result;
+        Ok(())
     }
 
     async fn fail(&self, upload_id: &str, message: String) -> ApiError {
@@ -532,7 +562,7 @@ pub fn validate_entry_name(name: &str) -> Result<(), String> {
 
 /// Builtins a declarative tool may reference (spec 5.3: a skill may compose
 /// existing validated tools; arbitrary URLs are never trusted).
-const KNOWN_BUILTINS: &[&str] = &[
+pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "builtin.echo",
     "builtin.noop",
     "builtin.file_list",
@@ -548,6 +578,10 @@ const KNOWN_BUILTINS: &[&str] = &[
     "builtin.code_search",
     "builtin.exec_shell",
     "builtin.exec_python",
+    "builtin.ssh_connect",
+    "builtin.ssh_disconnect",
+    "builtin.ssh_list",
+    "builtin.exec_ssh",
     "builtin.notify_user",
     "builtin.github_list_files",
     "builtin.github_read_file",
@@ -555,6 +589,24 @@ const KNOWN_BUILTINS: &[&str] = &[
     "builtin.github_list_issues",
     "builtin.github_create_issue",
     "builtin.github_create_pr",
+    "builtin.github_me",
+    "builtin.github_list_repos",
+    "builtin.github_search_repos",
+    "builtin.github_list_prs",
+    "builtin.github_get_pr",
+    "builtin.github_merge_pr",
+    "builtin.git_clone",
+    "builtin.git_status",
+    "builtin.git_pull",
+    "builtin.git_fetch",
+    "builtin.git_push",
+    "builtin.git_merge",
+    "builtin.git_branch",
+    "builtin.git_checkout",
+    "builtin.git_commit",
+    "builtin.git_log",
+    "builtin.git_diff",
+    "builtin.git_remote",
 ];
 
 /// Integration operations a declarative tool may reference. Dispatched by
