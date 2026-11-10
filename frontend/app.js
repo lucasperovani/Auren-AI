@@ -719,7 +719,9 @@ views.chat = async (content) => {
     if (!text) return;
     input.value = '';
     addBubble('user', text);
-    const pending = addBubble('assistant', '…');
+    // A typing indicator, not a placeholder bubble: it is replaced by the
+    // streamed answer as soon as the first token arrives.
+    const pending = addTypingIndicator();
     try {
       // Create the conversation lazily on the first message of a new chat.
       if (!currentConversationId) {
@@ -727,22 +729,133 @@ views.chat = async (content) => {
         currentConversationId = conversation.id;
         sessionStorage.setItem('auren_conv', currentConversationId);
       }
-      const result = await api('POST', `/conversations/${currentConversationId}/messages`, { content: text });
-      pending.remove();
-      const replyBubble = addBubble('assistant', result.reply);
-      if (result.error) replyBubble.classList.add('error-bubble');
-      addToolTrace(replyBubble, result.tool_trace);
+      const result = await streamMessage(currentConversationId, text, pending);
+      if (result.error) result.bubble.classList.add('error-bubble');
+      addToolTrace(result.bubble, result.tool_trace);
       // Update the sidebar in place: move/insert this conversation at the top
       // without re-rendering the chat (which would lose the transcript).
       updateChatSidebar(text.slice(0, 60));
     } catch (err) {
-      pending.textContent = `Error: ${err.message}`;
-      pending.classList.add('error-bubble');
+      pending.remove();
+      const bubble = addBubble('assistant', `Error: ${err.message}`);
+      bubble.classList.add('error-bubble');
     }
   };
   send.addEventListener('click', submit);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
 };
+
+/// Animated "thinking" indicator: three dots that move while the agent works.
+function addTypingIndicator() {
+  const container = document.getElementById('chat-messages');
+  const el = document.createElement('div');
+  el.className = 'chat-typing';
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-label', 'The agent is thinking');
+  el.innerHTML = '<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>';
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+  return el;
+}
+
+/// Send a chat message and render the answer as it streams in.
+///
+/// Uses the SSE endpoint so text appears progressively. If streaming is
+/// unavailable (older server, proxy that buffers), it transparently falls back
+/// to the regular request so the chat never breaks.
+async function streamMessage(conversationId, text, pending) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
+
+  let response;
+  try {
+    response = await fetch(`${API}/conversations/${conversationId}/messages/stream`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ content: text }),
+    });
+  } catch {
+    return fallbackMessage(conversationId, text, pending);
+  }
+  if (!response.ok || !response.body) {
+    return fallbackMessage(conversationId, text, pending);
+  }
+
+  const container = document.getElementById('chat-messages');
+  let bubble = null;
+  let accumulated = '';
+  let done = null;
+  let failure = null;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const handleEvent = (rawEvent) => {
+    // SSE frames are separated by a blank line; each has `event:` and `data:`.
+    const lines = rawEvent.split('\n');
+    let name = 'message';
+    let data = '';
+    for (const line of lines) {
+      if (line.startsWith('event:')) name = line.slice(6).trim();
+      else if (line.startsWith('data:')) data += line.slice(5).trim();
+    }
+    if (!data) return;
+    let payload;
+    try { payload = JSON.parse(data); } catch { return; }
+
+    if (name === 'delta' && payload.text) {
+      // First token: replace the indicator with the real bubble.
+      if (!bubble) {
+        pending.remove();
+        bubble = addBubble('assistant', '');
+      }
+      accumulated += payload.text;
+      if (window.marked) bubble.innerHTML = marked.parse(accumulated);
+      else bubble.textContent = accumulated;
+      container.scrollTop = container.scrollHeight;
+    } else if (name === 'done') {
+      done = payload;
+    } else if (name === 'error') {
+      failure = payload.message;
+    }
+  };
+
+  while (true) {
+    const { value, done: finished } = await reader.read();
+    if (finished) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary;
+    while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      handleEvent(rawEvent);
+    }
+  }
+
+  pending.remove();
+  if (!bubble) {
+    // No deltas arrived (buffered proxy or empty answer): show the final text.
+    bubble = addBubble('assistant', done?.reply || failure || 'No response.');
+  }
+  if (failure && !accumulated) {
+    bubble.classList.add('error-bubble');
+  }
+  return {
+    bubble,
+    reply: done?.reply || accumulated,
+    tool_trace: done?.tool_trace || [],
+    error: Boolean(done?.error || failure),
+  };
+}
+
+/// Non-streaming request, used when the SSE endpoint is not available.
+async function fallbackMessage(conversationId, text, pending) {
+  const result = await api('POST', `/conversations/${conversationId}/messages`, { content: text });
+  pending.remove();
+  const bubble = addBubble('assistant', result.reply);
+  return { bubble, reply: result.reply, tool_trace: result.tool_trace, error: Boolean(result.error) };
+}
 
 // ---------------------------------------------------------------------------
 // Shared UI helpers

@@ -534,6 +534,26 @@ pub async fn activate_version(
         .execute(&mut *tx)
         .await?;
     tx.commit().await.map_err(ApiError::from)?;
+
+    // Point every agent that had the previous version at the new one, so the
+    // change is visible on the next chat message instead of only after a
+    // restart. `sync_agent_skills` also runs per turn as a safety net for any
+    // link created between activations.
+    let agents = sqlx::query(
+        "SELECT DISTINCT ask.agent_id FROM agent_skills ask
+         JOIN skill_versions sv ON sv.id = ask.skill_version_id
+         WHERE sv.skill_id = ?",
+    )
+    .bind(&skill_id)
+    .fetch_all(&state.db)
+    .await?;
+    for agent in agents {
+        let agent_id: String = agent.get("agent_id");
+        if let Err(e) = crate::services::tool_sync::sync_agent_skills(&state.db, &agent_id).await {
+            tracing::warn!(error = %e, "failed to relink agent after version activation");
+        }
+    }
+
     Ok(Json(json!({ "skill_id": skill_id, "active_version_id": version_id })))
 }
 

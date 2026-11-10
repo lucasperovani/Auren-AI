@@ -25,6 +25,7 @@ pub mod task;
 pub mod task_collab;
 pub mod task_tools;
 pub mod tool_registry;
+pub mod tool_sync;
 pub mod web_research;
 pub mod worker;
 

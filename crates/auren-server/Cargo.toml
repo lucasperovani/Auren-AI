@@ -32,6 +32,7 @@ aes-gcm = { workspace = true }
 reqwest = { workspace = true }
 axum-extra = { workspace = true }
 futures-util = { workspace = true }
+async-stream = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

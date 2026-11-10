@@ -140,6 +140,29 @@ pub trait LlmProvider: Send + Sync {
         tools: &[LlmToolDefinition],
         max_tokens: Option<u64>,
     ) -> Result<LlmCompletion, LlmError>;
+
+    /// Stream a completion, invoking `on_delta` for each text chunk.
+    ///
+    /// Returns the same completion shape as `complete`, with the full text
+    /// assembled. Providers that cannot stream fall back to a single call and
+    /// emit the whole answer as one delta, so callers never need a separate
+    /// code path.
+    ///
+    /// Tool calls are not streamed incrementally: they arrive complete in the
+    /// final response, which keeps the tool loop unchanged.
+    async fn stream(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[LlmToolDefinition],
+        max_tokens: Option<u64>,
+        on_delta: &(dyn for<'a> Fn(&'a str) + Send + Sync),
+    ) -> Result<LlmCompletion, LlmError> {
+        let completion = self.complete(messages, tools, max_tokens).await?;
+        if !completion.content.is_empty() {
+            on_delta(&completion.content);
+        }
+        Ok(completion)
+    }
 }
 
 /// Build a provider client from a stored configuration row.
@@ -312,6 +335,172 @@ pub mod providers {
                 input_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()),
                 output_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()),
                 finish_reason: choice.get("finish_reason").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            })
+        }
+
+        async fn stream(
+            &self,
+            messages: &[LlmMessage],
+            tools: &[LlmToolDefinition],
+            max_tokens: Option<u64>,
+            on_delta: &(dyn for<'a> Fn(&'a str) + Send + Sync),
+        ) -> Result<LlmCompletion, LlmError> {
+            self.stream_impl(messages, tools, max_tokens, on_delta).await
+        }
+    }
+
+    /// Streaming implementation using the OpenAI `stream: true` SSE protocol.
+    ///
+    /// Deltas are forwarded as they arrive so the UI can render the answer
+    /// progressively. Tool calls are still delivered whole: they only appear
+    /// once the stream ends, and the tool loop treats the assembled completion
+    /// exactly like a non-streamed one.
+    impl OpenAiCompatibleProvider {
+        async fn stream_impl(
+            &self,
+            messages: &[LlmMessage],
+            tools: &[LlmToolDefinition],
+            max_tokens: Option<u64>,
+            on_delta: &(dyn for<'a> Fn(&'a str) + Send + Sync),
+        ) -> Result<LlmCompletion, LlmError> {
+            use futures_util::StreamExt;
+
+            let mut body = serde_json::json!({
+                "model": self.model,
+                "messages": messages,
+                "stream": true,
+            });
+            if let Some(max) = max_tokens {
+                body["max_tokens"] = serde_json::json!(max);
+            }
+            if !tools.is_empty() {
+                body["tools"] = serde_json::json!(tools
+                    .iter()
+                    .map(|t| serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    }))
+                    .collect::<Vec<_>>());
+            }
+
+            let mut request = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .timeout(std::time::Duration::from_secs(120))
+                .json(&body);
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
+            }
+            let response = request.send().await.map_err(|e| {
+                if e.is_timeout() {
+                    LlmError::Timeout
+                } else {
+                    tracing::debug!(error = %e, "llm stream request failed");
+                    LlmError::RequestFailed
+                }
+            })?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                tracing::warn!(status = status.as_u16(), body = %body, "llm stream provider error");
+                return Err(match status {
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => LlmError::AuthenticationFailed,
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => LlmError::RateLimited,
+                    _ => LlmError::RequestFailed,
+                });
+            }
+
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut content = String::new();
+            // Tool calls arrive as partial fragments keyed by index; they are
+            // assembled once the stream completes.
+            let mut tool_acc: Vec<(String, String, String)> = Vec::new();
+            let mut finish_reason: Option<String> = None;
+            let mut input_tokens: Option<u64> = None;
+            let mut output_tokens: Option<u64> = None;
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| LlmError::RequestFailed)?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Process complete lines only: a chunk can split a line.
+                while let Some(newline) = buffer.find('\n') {
+                    let line: String = buffer.drain(..=newline).collect();
+                    let line = line.trim();
+                    let Some(data) = line.strip_prefix("data:") else { continue };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+                    let Ok(payload) = serde_json::from_str::<Value>(data) else { continue };
+
+                    if let Some(usage) = payload.get("usage") {
+                        input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).or(input_tokens);
+                        output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).or(output_tokens);
+                    }
+
+                    let Some(choice) = payload.get("choices").and_then(|c| c.get(0)) else { continue };
+                    if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                        finish_reason = Some(reason.to_string());
+                    }
+                    let Some(delta) = choice.get("delta") else { continue };
+
+                    // Text delta: forward immediately.
+                    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                        if !text.is_empty() {
+                            content.push_str(text);
+                            on_delta(text);
+                        }
+                    }
+
+                    // Tool call fragments: accumulate by index.
+                    if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        for call in calls {
+                            let index = call
+                                .get("index")
+                                .and_then(|i| i.as_u64())
+                                .unwrap_or(0) as usize;
+                            while tool_acc.len() <= index {
+                                tool_acc.push((String::new(), String::new(), String::new()));
+                            }
+                            if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                                tool_acc[index].0 = id.to_string();
+                            }
+                            if let Some(func) = call.get("function") {
+                                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                    tool_acc[index].1.push_str(name);
+                                }
+                                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                    tool_acc[index].2.push_str(args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let tool_calls = tool_acc
+                .into_iter()
+                .filter(|(_, name, _)| !name.is_empty())
+                .map(|(id, name, args)| LlmToolCall {
+                    id,
+                    name,
+                    arguments: serde_json::from_str(&args).unwrap_or(serde_json::json!({})),
+                })
+                .collect();
+
+            Ok(LlmCompletion {
+                content,
+                tool_calls,
+                input_tokens,
+                output_tokens,
+                finish_reason,
             })
         }
     }

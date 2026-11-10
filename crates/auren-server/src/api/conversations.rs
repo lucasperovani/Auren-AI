@@ -20,6 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_conversations).post(create_conversation))
         .route("/{conversation_id}", get(get_conversation).patch(update_conversation).delete(delete_conversation))
         .route("/{conversation_id}/messages", get(list_messages).post(post_message))
+        .route("/{conversation_id}/messages/stream", post(post_message_stream))
         .route("/{conversation_id}/resume", post(resume_after_approval))
         .route("/{conversation_id}/auto-approve", get(get_conversation_auto_approve).put(put_conversation_auto_approve))
 }
@@ -320,6 +321,123 @@ pub struct PostMessageRequest {
 /// history, and the assistant's response is persisted and returned. Chat
 /// never creates tasks on its own — tasks are created only when the user
 /// (or the agent, at the user's request) explicitly registers one.
+/// Stream a chat turn as Server-Sent Events.
+///
+/// Events, in order:
+///   `delta`  — `{ "text": "..." }` incremental answer text
+///   `done`   — `{ "assistant_message_id", "tool_trace", "reply" }`
+///   `error`  — `{ "message": "..." }`
+///
+/// The reply is persisted exactly like the non-streaming path, so reloading
+/// the conversation shows the same content either way.
+pub async fn post_message_stream(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(conversation_id): Path<String>,
+    Json(req): Json<PostMessageRequest>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    require_owned_conversation(&state, &user, &conversation_id).await?;
+    if req.content.trim().is_empty() {
+        return Err(ApiError::Unprocessable("content is required".into()));
+    }
+
+    let agent_id: String = sqlx::query("SELECT agent_id FROM conversations WHERE id = ?")
+        .bind(&conversation_id)
+        .fetch_one(&state.db)
+        .await?
+        .get("agent_id");
+
+    // Persist the user message before streaming starts: if the client
+    // disconnects mid-answer, the question is still recorded.
+    let user_message_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)")
+        .bind(&user_message_id)
+        .bind(&conversation_id)
+        .bind(req.content.trim())
+        .bind(&now)
+        .execute(&state.db)
+        .await?;
+    sqlx::query("UPDATE conversations SET updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(&conversation_id)
+        .execute(&state.db)
+        .await?;
+
+    // Deltas travel from the agent's callback (running inside the future) to
+    // this streamed body. `spawn_blocking` is not needed because the channel
+    // is unbounded and the callback never awaits.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let stream_state = state.clone();
+    let prompt = req.content.trim().to_string();
+    let conversation = conversation_id.clone();
+    let agent = agent_id.clone();
+    let user_message = user_message_id.clone();
+
+    tokio::spawn(async move {
+        // The callback forwards each delta as a `delta` SSE event.
+        let tx_delta = tx.clone();
+        let on_delta = move |text: &str| {
+            let event = format!(
+                "event: delta\ndata: {}\n\n",
+                serde_json::json!({ "text": text })
+            );
+            let _ = tx_delta.send(event);
+        };
+
+        match run_agent_turn_streaming(
+            &stream_state,
+            &conversation,
+            &agent,
+            &prompt,
+            &on_delta,
+        )
+        .await
+        {
+            Ok(turn) => {
+                let _ = tx.send(format!(
+                    "event: done\ndata: {}\n\n",
+                    serde_json::json!({
+                        "user_message_id": user_message,
+                        "assistant_message_id": turn.assistant_message_id,
+                        "reply": turn.reply,
+                        "tool_trace": turn.tool_trace,
+                        "error": turn.error,
+                    })
+                ));
+            }
+        Err(e) => {
+            let _ = tx.send(format!(
+                "event: error\ndata: {}\n\n",
+                serde_json::json!({ "message": e.to_string() })
+            ));
+        }
+        }
+    });
+
+    let body = async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            yield Ok::<_, std::convert::Infallible>(chunk);
+        }
+    };
+
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            (
+                axum::http::header::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response())
+}
+
 pub async fn post_message(
     State(state): State<AppState>,
     user: AuthUser,
@@ -441,6 +559,9 @@ pub struct AgentTurn {
     pub reply: String,
     pub tool_trace: Vec<serde_json::Value>,
     pub error: bool,
+    /// Id of the persisted assistant message, so streamed clients can
+    /// reconcile the message they rendered with the stored one.
+    pub assistant_message_id: String,
 }
 
 /// Run one agent turn in a conversation: persist the user message, let the
@@ -451,6 +572,18 @@ pub async fn run_agent_turn(
     conversation_id: &str,
     agent_id: &str,
     prompt: &str,
+) -> ApiResult<AgentTurn> {
+    run_agent_turn_streaming(state, conversation_id, agent_id, prompt, &|_| {}).await
+}
+
+/// Streaming variant: `on_delta` receives each text chunk as the model
+/// produces it. The persisted reply is identical to the non-streaming path.
+pub async fn run_agent_turn_streaming(
+    state: &AppState,
+    conversation_id: &str,
+    agent_id: &str,
+    prompt: &str,
+    on_delta: &(dyn for<'a> Fn(&'a str) + Send + Sync),
 ) -> ApiResult<AgentTurn> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)")
@@ -467,15 +600,16 @@ pub async fn run_agent_turn(
         .await?;
 
     let runtime = crate::services::agent_runtime::AgentRuntime::new(state.clone());
-    let (reply, error) = match runtime.chat(agent_id, conversation_id, prompt).await {
+    let (reply, error) = match runtime.chat_streaming(agent_id, conversation_id, on_delta).await {
         Ok(reply) => (reply, false),
         // Honest failure: the reply says why instead of pretending success.
         Err(e) => (format!("The agent could not respond: {e}"), true),
     };
     let tool_trace = runtime.last_tool_trace.lock().expect("trace poisoned").clone();
 
+    let assistant_message_id = uuid::Uuid::new_v4().to_string();
     sqlx::query("INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)")
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&assistant_message_id)
         .bind(conversation_id)
         .bind(&reply)
         .bind(json!({ "tool_trace": tool_trace }).to_string())
@@ -483,7 +617,7 @@ pub async fn run_agent_turn(
         .execute(&state.db)
         .await?;
 
-    Ok(AgentTurn { reply, tool_trace, error })
+    Ok(AgentTurn { reply, tool_trace, error, assistant_message_id })
 }
 
 /// Conversation used to carry out notification actions: one per user, so the

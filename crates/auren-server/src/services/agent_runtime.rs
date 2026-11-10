@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::{
+    error::ApiError,
     services::{
         llm::{LlmMessage, LlmProvider, LlmToolDefinition},
         tool_registry::{Authorization, ToolRegistry},
@@ -269,35 +270,154 @@ impl AgentRuntime {
         .ok()
     }
 
-    /// Tools available to the agent from enabled skills.
+    /// Tools available to the agent from enabled skills, resolved through each
+    /// skill's **active** version, plus every tool exposed by the user's
+    /// enabled MCP servers.
+    ///
+    /// `tool_sync::sync_agent_skills` repoints stale links before this runs, so
+    /// the join against `skills.active_version_id` is what makes a newly
+    /// activated version visible immediately instead of only after a restart.
     async fn available_tools(&self, agent_id: &str) -> Vec<LlmToolDefinition> {
+        // Bring links in line with the current versions first: a skill updated
+        // mid-conversation must be visible on the very next message.
+        if let Err(e) = crate::services::tool_sync::sync_agent_skills(&self.state.db, agent_id).await {
+            tracing::warn!(error = %e, "failed to sync agent skill versions");
+        }
+
         let rows = sqlx::query(
             "SELECT st.tool_name, st.description, st.input_schema_json
              FROM skill_tools st
-             JOIN agent_skills ask ON ask.skill_version_id = st.skill_version_id
              JOIN skill_versions sv ON sv.id = st.skill_version_id
              JOIN skills sk ON sk.id = sv.skill_id
-             WHERE ask.agent_id = ? AND ask.enabled = 1 AND sk.status = 'enabled'",
+             JOIN agent_skills ask
+               ON ask.skill_version_id = st.skill_version_id
+              AND ask.agent_id = ?
+              AND ask.enabled = 1
+             WHERE sk.status = 'enabled'
+               AND sk.active_version_id = sv.id",
         )
         .bind(agent_id)
         .fetch_all(&self.state.db)
         .await
         .unwrap_or_default();
-        rows.iter()
+        let mut tools: Vec<LlmToolDefinition> = rows
+            .iter()
             .map(|r| LlmToolDefinition {
                 name: r.get("tool_name"),
                 description: r.get("description"),
                 input_schema: serde_json::from_str(&r.get::<String, _>("input_schema_json")).unwrap_or(json!({})),
             })
-            .collect()
+            .collect();
+
+        // MCP tools are discovered from the servers themselves, so their
+        // catalogue is refreshed on every turn (see below) rather than read
+        // from local storage.
+        tools.extend(self.mcp_tools(agent_id).await);
+        tools
     }
 
-        async fn resolve_tool(&self, agent_id: &str, tool_name: &str) -> Option<String> {
+    /// Tools exposed by the user's enabled MCP servers.
+    ///
+    /// The tool list is fetched from each server and cached per process for a
+    /// short TTL: servers can add or remove tools without any local write, but
+    /// re-listing on every single turn would add latency to each message.
+    async fn mcp_tools(&self, agent_id: &str) -> Vec<LlmToolDefinition> {
+        let servers = match self.mcp_servers_for_agent(agent_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load MCP servers");
+                return Vec::new();
+            }
+        };
+
+        let mut out = Vec::new();
+        for server in servers {
+            match crate::services::mcp::list_server_tools(&server).await {
+                Ok(tools) => {
+                    for tool in tools {
+                        // MCP tool names are namespaced so two servers cannot
+                        // collide, and so `resolve_tool` can route the call.
+                        out.push(LlmToolDefinition {
+                            name: format!("mcp__{}__{}", server.id, tool.name),
+                            description: tool.description,
+                            input_schema: tool.input_schema,
+                        });
+                    }
+                }
+                Err(e) => {
+                    // A broken server must not take the whole turn down.
+                    tracing::warn!(server = %server.name, error = %e, "MCP tool listing failed");
+                }
+            }
+        }
+        out
+    }
+
+    /// Invoke a tool on a remote MCP server by id.
+    async fn call_mcp_tool(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, ApiError> {
+        let row = sqlx::query("SELECT value_json FROM app_settings WHERE key = ?")
+            .bind(format!("mcp_server:{server_id}"))
+            .fetch_optional(&self.state.db)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let raw: String = row.get("value_json");
+        let server: crate::services::mcp::McpServerConfig = serde_json::from_str(&raw)
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("corrupt MCP server config")))?;
+        if !server.enabled {
+            return Err(ApiError::Conflict("MCP server is disabled".into()));
+        }
+        crate::services::mcp::invoke_server_tool(&server, tool_name, arguments).await
+    }
+
+    /// Enabled MCP servers owned by the agent's user.
+    async fn mcp_servers_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::services::mcp::McpServerConfig>, ApiError> {
+        let rows = sqlx::query(
+            "SELECT s.key, s.value_json FROM app_settings s
+             WHERE s.key LIKE 'mcp_server:%'
+               AND EXISTS (
+                   SELECT 1 FROM agents a WHERE a.id = ? AND a.user_id = (
+                       SELECT user_id FROM agents WHERE id = ?
+                   )
+               )",
+        )
+        .bind(agent_id)
+        .bind(agent_id)
+        .fetch_all(&self.state.db)
+        .await?;
+
+        let mut servers = Vec::new();
+        for row in rows {
+            let raw: String = row.get("value_json");
+            match serde_json::from_str::<crate::services::mcp::McpServerConfig>(&raw) {
+                Ok(server) if server.enabled => servers.push(server),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "corrupt MCP server config"),
+            }
+        }
+        Ok(servers)
+    }
+
+    async fn resolve_tool(&self, agent_id: &str, tool_name: &str) -> Option<String> {
+        // MCP tools are not rows in `skill_tools`; they are routed by name.
+        if tool_name.starts_with("mcp__") {
+            return Some(tool_name.to_string());
+        }
+        // Same rule as `available_tools`: only the active version counts.
         let row = sqlx::query(
             "SELECT st.id FROM skill_tools st
              JOIN agent_skills ask ON ask.skill_version_id = st.skill_version_id
-             JOIN skills sk ON sk.id = (SELECT skill_id FROM skill_versions WHERE id = st.skill_version_id)
-             WHERE ask.agent_id = ? AND st.tool_name = ? AND ask.enabled = 1 AND sk.status = 'enabled'",
+             JOIN skill_versions sv ON sv.id = st.skill_version_id
+             JOIN skills sk ON sk.id = sv.skill_id
+             WHERE ask.agent_id = ? AND st.tool_name = ? AND ask.enabled = 1
+               AND sk.status = 'enabled' AND sk.active_version_id = sv.id",
         )
         .bind(agent_id)
         .bind(tool_name)
@@ -323,6 +443,20 @@ impl AgentRuntime {
     /// LLM interaction: it never creates tasks or invokes tools on its own.
     /// Tasks are created only when explicitly requested and confirmed.
     pub async fn chat(&self, agent_id: &str, conversation_id: &str, _user_message: &str) -> Result<String, String> {
+        self.chat_streaming(agent_id, conversation_id, &|_| {}).await
+    }
+
+    /// Chat with an incremental text callback.
+    ///
+    /// Every provider streams through its `stream` implementation; the default
+    /// trait method makes non-streaming providers emit the whole answer as one
+    /// delta, so the caller's behavior is uniform.
+    pub async fn chat_streaming(
+        &self,
+        agent_id: &str,
+        conversation_id: &str,
+        on_delta: &(dyn for<'a> Fn(&'a str) + Send + Sync),
+    ) -> Result<String, String> {
         // Reset the trace for this exchange.
         self.last_tool_trace.lock().expect("trace poisoned").clear();
         let provider = self
@@ -385,7 +519,7 @@ impl AgentRuntime {
 
         for _iteration in 0..8 {
             let completion = provider
-                .complete(&messages, &available_tools, None)
+                .stream(&messages, &available_tools, None, on_delta)
                 .await
                 .map_err(|e| format!("LLM request failed: {e}"))?;
 
@@ -408,6 +542,33 @@ impl AgentRuntime {
                     return Ok(completion.content);
                 }
                 tool_calls_made += 1;
+
+                // MCP tools bypass the local registry: they live on a remote
+                // server and were already advertised to the model, so the call
+                // is routed by name. The server is the one the user connected,
+                // so no further authorization applies.
+                if let Some(rest) = call.name.strip_prefix("mcp__") {
+                    if let Some((server_id, tool_name)) = rest.split_once("__") {
+                        let result = self.call_mcp_tool(server_id, tool_name, &call.arguments).await;
+                        self.last_tool_trace.lock().expect("trace poisoned").push(json!({
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "status": if result.is_ok() { "ok" } else { "error" },
+                            "error": result.as_ref().err().map(|e| e.to_string()),
+                        }));
+                        let content = match result {
+                            Ok(value) => value.to_string(),
+                            Err(e) => format!("tool error: {e}"),
+                        };
+                        messages.push(LlmMessage {
+                            role: "tool".into(),
+                            content,
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                        continue;
+                    }
+                }
 
                 let tool_id = self.resolve_tool(agent_id, &call.name).await;
                 let Some(tool_id) = tool_id else {
