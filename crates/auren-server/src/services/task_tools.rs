@@ -7,6 +7,33 @@ use sqlx::Row;
 
 use crate::{error::ApiError, state::AppState};
 
+/// Resolve the project a tool call refers to. The agent may pass a project id
+/// or a name (`project_id` or `project`), and an unknown reference is an error
+/// rather than a silent fallback to the default board — otherwise work would
+/// land in the wrong place.
+async fn resolve_project_ref(
+    state: &AppState,
+    user_id: &str,
+    args: &Value,
+) -> Result<Option<String>, ApiError> {
+    let reference = args
+        .get("project_id")
+        .or_else(|| args.get("project"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    match crate::services::projects::ProjectService::new(state)
+        .resolve(user_id, reference)
+        .await?
+    {
+        Some(id) => Ok(Some(id)),
+        None => Err(ApiError::NotFound),
+    }
+}
+
 /// Execute a task-management builtin.
 pub async fn execute_task_tool(
     state: &AppState,
@@ -31,8 +58,9 @@ pub async fn execute_task_tool(
             })?;
             let schedule = args.get("schedule").filter(|s| !s.is_null());
             let timezone = args.get("timezone").and_then(|v| v.as_str()).unwrap_or("UTC");
+            let project_id = resolve_project_ref(state, user_id, args).await?;
             let task_id = service
-                .create(user_id, &agent_id, title, objective, schedule, timezone, None)
+                .create(user_id, &agent_id, title, objective, schedule, timezone, None, project_id.as_deref())
                 .await?;
             Ok(json!({
                 "task_id": task_id,
@@ -69,10 +97,30 @@ pub async fn execute_task_tool(
             Ok(json!({ "task_id": task_id, "deleted": true }))
         }
         "task_list" => {
-            let rows = sqlx::query("SELECT id, title, status, schedule_json FROM tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50")
-                .bind(user_id)
-                .fetch_all(&state.db)
-                .await?;
+            // Scoped by project when one is given, so the agent never sees (or
+            // acts on) work from another project by accident.
+            let project_id = resolve_project_ref(state, user_id, args).await?;
+            let rows = match &project_id {
+                Some(project_id) => {
+                    sqlx::query(
+                        "SELECT id, title, status, stage, project_id, schedule_json FROM tasks
+                         WHERE user_id = ? AND project_id = ? ORDER BY updated_at DESC LIMIT 100",
+                    )
+                    .bind(user_id)
+                    .bind(project_id)
+                    .fetch_all(&state.db)
+                    .await?
+                }
+                None => {
+                    sqlx::query(
+                        "SELECT id, title, status, stage, project_id, schedule_json FROM tasks
+                         WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100",
+                    )
+                    .bind(user_id)
+                    .fetch_all(&state.db)
+                    .await?
+                }
+            };
             let items: Vec<Value> = rows
                 .iter()
                 .map(|r| {
@@ -80,6 +128,8 @@ pub async fn execute_task_tool(
                         "task_id": r.get::<String, _>("id"),
                         "title": r.get::<String, _>("title"),
                         "status": r.get::<String, _>("status"),
+                        "stage": r.try_get::<String, _>("stage").unwrap_or_else(|_| "todo".into()),
+                        "project_id": r.try_get::<Option<String>, _>("project_id").unwrap_or(None),
                         "schedule": r.get::<Option<String>, _>("schedule_json")
                             .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
                     })
@@ -107,6 +157,102 @@ pub async fn execute_task_tool(
             })?;
             service.set_status(user_id, task_id, "active").await?;
             Ok(json!({ "task_id": task_id, "status": "active" }))
+        }
+        // Board control: the agent moves cards between columns exactly like the
+        // user does. Moving never starts work by itself.
+        "task_move" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("task_id is required".into())
+            })?;
+            let stage = args.get("stage").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable(
+                    "stage is required: analysis, todo, in_progress or done".into(),
+                )
+            })?;
+            service.set_stage(user_id, task_id, stage).await?;
+            Ok(json!({ "task_id": task_id, "stage": stage, "moved": true }))
+        }
+        // Assign the card to the agent for immediate execution. This is the
+        // same action as the user confirming the assignment popup.
+        "task_assign" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("task_id is required".into())
+            })?;
+            // Refuse work that depends on unfinished cards instead of starting
+            // something that cannot complete.
+            let blockers = crate::services::task_collab::TaskCollabService::new(state)
+                .open_blockers(task_id)
+                .await?;
+            if !blockers.is_empty() {
+                return Err(ApiError::Conflict(format!(
+                    "task is blocked by unfinished work: {}",
+                    blockers.join(", ")
+                )));
+            }
+            service.set_stage(user_id, task_id, "in_progress").await?;
+            let run_id = service.request_run(user_id, task_id).await?;
+            Ok(json!({
+                "task_id": task_id,
+                "task_run_id": run_id,
+                "stage": "in_progress",
+                "assigned": true,
+                "note": "the run is queued; the agent executes it in the background",
+            }))
+        }
+        // Write a note on the card: the running context of the work.
+        "task_note" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("task_id is required".into())
+            })?;
+            let body = args.get("body").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("body is required".into())
+            })?;
+            let note_id = crate::services::task_collab::TaskCollabService::new(state)
+                .add_note(user_id, task_id, "agent", body)
+                .await?;
+            Ok(json!({ "task_id": task_id, "note_id": note_id, "added": true }))
+        }
+        "task_link" => {
+            let from_task_id = args.get("task_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("task_id is required".into())
+            })?;
+            let to_task_id = args.get("related_task_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("related_task_id is required".into())
+            })?;
+            let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("relates");
+            let link_id = crate::services::task_collab::TaskCollabService::new(state)
+                .link(user_id, from_task_id, to_task_id, kind)
+                .await?;
+            Ok(json!({ "link_id": link_id, "kind": kind, "linked": true }))
+        }
+        "task_unlink" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("task_id is required".into())
+            })?;
+            let link_id = args.get("link_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("link_id is required".into())
+            })?;
+            crate::services::task_collab::TaskCollabService::new(state)
+                .unlink(user_id, task_id, link_id)
+                .await?;
+            Ok(json!({ "link_id": link_id, "unlinked": true }))
+        }
+        "project_create" => {
+            let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::Unprocessable("name is required".into())
+            })?;
+            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let color = args.get("color").and_then(|v| v.as_str());
+            let project_id = crate::services::projects::ProjectService::new(state)
+                .create(user_id, name, description, color)
+                .await?;
+            Ok(json!({ "project_id": project_id, "name": name, "created": true }))
+        }
+        "project_list" => {
+            let projects = crate::services::projects::ProjectService::new(state)
+                .list(user_id)
+                .await?;
+            Ok(json!({ "projects": projects }))
         }
         // Subagent delegation: the agent creates a specialized subagent and
         // delegates work to it. The subagent runs its own bounded LLM loop

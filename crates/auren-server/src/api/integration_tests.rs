@@ -679,8 +679,193 @@ async fn quota_rolls_over_after_the_window() {
     assert!(!status.exhausted());
 }
 
-/// The task payload carries everything the UI needs to describe a schedule in
-/// plain language: the cron, the next fire time, and the latest run.
+/// Projects isolate boards: tasks from one project never appear in another,
+/// and deleting a project keeps its tasks.
+#[tokio::test]
+async fn projects_isolate_boards_and_keep_tasks_on_delete() {
+    let (app, state, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+
+    let (status, alpha) = post_json(&app, "/api/v1/projects", Some(&token), json!({ "name": "Alpha" })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let alpha_id = alpha["id"].as_str().unwrap().to_string();
+    let (_, beta) = post_json(&app, "/api/v1/projects", Some(&token), json!({ "name": "Beta" })).await;
+    let beta_id = beta["id"].as_str().unwrap().to_string();
+
+    // A duplicate name is rejected so the agent can resolve projects by name.
+    let (status, _) = post_json(&app, "/api/v1/projects", Some(&token), json!({ "name": "alpha" })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (_, in_alpha) = post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "Alpha task", "objective": "O", "project_id": alpha_id }),
+    ).await;
+    assert_eq!(in_alpha["project_id"], alpha_id);
+    assert_eq!(in_alpha["project_name"], "Alpha");
+    post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "Beta task", "objective": "O", "project_id": beta_id }),
+    ).await;
+    post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "Loose task", "objective": "O" }),
+    ).await;
+
+    // Each board only shows its own work.
+    let (_, list) = get_json(&app, &format!("/api/v1/tasks?limit=50&project_id={alpha_id}"), Some(&token)).await;
+    let titles: Vec<&str> = list["items"].as_array().unwrap().iter()
+        .filter_map(|t| t["title"].as_str()).collect();
+    assert_eq!(titles, vec!["Alpha task"]);
+
+    // `none` selects the default board.
+    let (_, loose) = get_json(&app, "/api/v1/tasks?limit=50&project_id=none", Some(&token)).await;
+    let loose_titles: Vec<&str> = loose["items"].as_array().unwrap().iter()
+        .filter_map(|t| t["title"].as_str()).collect();
+    assert_eq!(loose_titles, vec!["Loose task"]);
+
+    // A task cannot join a project the user does not own.
+    let (status, _) = post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "X", "objective": "O", "project_id": "nope" }),
+    ).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Deleting the project detaches its tasks instead of destroying them.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/projects/{alpha_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let kept: i64 = sqlx::query("SELECT COUNT(*) AS n FROM tasks WHERE title = 'Alpha task'")
+        .fetch_one(&state.db).await.unwrap().get("n");
+    assert_eq!(kept, 1, "the task survives project deletion");
+}
+
+/// Assigning a task is the only stage change that starts work, and it refuses
+/// tasks blocked by unfinished work.
+#[tokio::test]
+async fn assigning_starts_a_run_and_respects_blockers() {
+    let (app, state, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+
+    let (_, blocker) = post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "Audit", "objective": "O" }),
+    ).await;
+    let (_, blocked) = post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "Write", "objective": "O" }),
+    ).await;
+    let blocker_id = blocker["id"].as_str().unwrap().to_string();
+    let blocked_id = blocked["id"].as_str().unwrap().to_string();
+
+    // Moving a card is organizational only: no run is created.
+    post_json(&app, &format!("/api/v1/tasks/{blocked_id}/stage"), Some(&token), json!({ "stage": "todo" })).await;
+    let runs: i64 = sqlx::query("SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?")
+        .bind(&blocked_id).fetch_one(&state.db).await.unwrap().get("n");
+    assert_eq!(runs, 0, "dragging never starts work");
+
+    // Audit blocks Write.
+    let (status, _) = post_json(
+        &app, &format!("/api/v1/tasks/{blocker_id}/links"), Some(&token),
+        json!({ "to_task_id": blocked_id, "kind": "blocks" }),
+    ).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The blocked task cannot be assigned.
+    let (status, body) = post_json(&app, &format!("/api/v1/tasks/{blocked_id}/assign"), Some(&token), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"]["message"].as_str().unwrap().contains("blocked"));
+    let still: String = sqlx::query("SELECT stage FROM tasks WHERE id = ?")
+        .bind(&blocked_id).fetch_one(&state.db).await.unwrap().get("stage");
+    assert_eq!(still, "todo", "a rejected assignment leaves the card where it was");
+
+    // The blocker can be assigned: it moves to In Progress and queues a run.
+    let (status, body) = post_json(&app, &format!("/api/v1/tasks/{blocker_id}/assign"), Some(&token), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "assigned");
+    assert!(body["task_run_id"].is_string());
+    assert_eq!(body["task"]["stage"], "in_progress");
+    let queued: i64 = sqlx::query("SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?")
+        .bind(&blocker_id).fetch_one(&state.db).await.unwrap().get("n");
+    assert_eq!(queued, 1);
+}
+
+/// Notes and links are scoped to the card, and the activity feed merges them
+/// with what the agent executed.
+#[tokio::test]
+async fn notes_links_and_activity_are_scoped_per_task() {
+    let (app, _s, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let (_, one) = post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "One", "objective": "O" }),
+    ).await;
+    let (_, two) = post_json(
+        &app, "/api/v1/tasks", Some(&token),
+        json!({ "agent_id": agent_id, "title": "Two", "objective": "O" }),
+    ).await;
+    let one_id = one["id"].as_str().unwrap().to_string();
+    let two_id = two["id"].as_str().unwrap().to_string();
+
+    let (status, _) = post_json(&app, &format!("/api/v1/tasks/{one_id}/notes"), Some(&token), json!({ "body": "First note" })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, notes) = get_json(&app, &format!("/api/v1/tasks/{one_id}/notes"), Some(&token)).await;
+    assert_eq!(notes["items"].as_array().unwrap().len(), 1);
+    // Notes never leak to another card.
+    let (_, other_notes) = get_json(&app, &format!("/api/v1/tasks/{two_id}/notes"), Some(&token)).await;
+    assert!(other_notes["items"].as_array().unwrap().is_empty());
+
+    // Self-links are rejected.
+    let (status, _) = post_json(
+        &app, &format!("/api/v1/tasks/{one_id}/links"), Some(&token),
+        json!({ "to_task_id": one_id, "kind": "relates" }),
+    ).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, link) = post_json(
+        &app, &format!("/api/v1/tasks/{one_id}/links"), Some(&token),
+        json!({ "to_task_id": two_id, "kind": "relates" }),
+    ).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let link_id = link["id"].as_str().unwrap().to_string();
+
+    // The activity feed includes the note and stays chronological.
+    let (status, activity) = get_json(&app, &format!("/api/v1/tasks/{one_id}/activity"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let kinds: Vec<&str> = activity["items"].as_array().unwrap().iter()
+        .filter_map(|i| i["kind"].as_str()).collect();
+    assert_eq!(kinds, vec!["note"]);
+
+    // Unlinking removes it.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/tasks/{one_id}/links/{link_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (_, links) = get_json(&app, &format!("/api/v1/tasks/{one_id}/links"), Some(&token)).await;
+    assert!(links["outgoing"].as_array().unwrap().is_empty());
+}
 #[tokio::test]
 async fn task_payload_exposes_schedule_and_last_run() {
     let (app, _s, _d) = app().await;

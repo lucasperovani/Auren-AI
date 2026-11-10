@@ -45,6 +45,9 @@ pub struct TaskPlan {
     pub timezone: String,
     /// Missing information the user must supply before confirmation.
     pub clarifications: Vec<Clarification>,
+    /// Project the confirmed task joins; `None` for the default board.
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub required_skills: Vec<String>,
     pub required_integrations: Vec<String>,
     pub approval_requirements: Vec<String>,
@@ -106,6 +109,18 @@ pub async fn create_plan(
         return Err(ApiError::NotFound);
     }
 
+    // Validate the project before the plan is stored, so confirmation cannot
+    // fail later on a project that never belonged to the user.
+    let project_id = match req.project_id.as_deref() {
+        Some(project_id) => {
+            crate::services::projects::ProjectService::new(&state)
+                .require_owned(&user.id, project_id)
+                .await?;
+            Some(project_id.to_string())
+        }
+        None => None,
+    };
+
     let now = chrono::Utc::now().to_rfc3339();
     let plan = TaskPlan {
         plan_id: uuid::Uuid::new_v4().to_string(),
@@ -116,6 +131,7 @@ pub async fn create_plan(
         objective: req.request.trim().to_string(),
         schedule: req.schedule,
         timezone: req.timezone.unwrap_or_else(|| "UTC".into()),
+        project_id,
         // Essential details the planner cannot infer are asked, not invented.
         clarifications: vec![Clarification {
             question: "When should this task run, and how often?".into(),
@@ -138,6 +154,9 @@ pub struct CreatePlanRequest {
     pub request: String,
     pub schedule: Option<serde_json::Value>,
     pub timezone: Option<String>,
+    /// Project the resulting task should join.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 pub async fn get_plan(
@@ -256,6 +275,8 @@ pub async fn confirm_plan(
             plan.schedule.as_ref(),
             &plan.timezone,
             None,
+            // A confirmed plan joins the project chosen when planning, if any.
+            plan.project_id.as_deref(),
         )
         .await?;
 

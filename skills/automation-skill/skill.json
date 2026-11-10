@@ -16,7 +16,7 @@
   "tools": [
     {
       "tool_name": "task_create",
-      "description": "Create a task. Provide a title, an objective (what to do), and optionally a schedule with a 5-field cron expression (UTC) for recurring work. Use this when the user asks for recurring or scheduled work.",
+      "description": "Create a task. Provide a title, an objective (what to do), and optionally a schedule with a 5-field cron expression (UTC) for recurring work. Use this when the user asks for recurring or scheduled work. Pass project_id to keep the task inside the right project.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -40,6 +40,10 @@
           "timezone": {
             "type": "string",
             "description": "IANA timezone, e.g. America/Sao_Paulo"
+          },
+          "project_id": {
+            "type": "string",
+            "description": "Project id or exact project name. Omit for the default board."
           }
         },
         "required": [
@@ -55,7 +59,14 @@
       "tool_name": "task_list",
       "description": "List the user's tasks with their schedules and statuses.",
       "input_schema": {
-        "type": "object"
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "description": "Only list tasks from this project (id or name)."
+          }
+        },
+        "required": []
       },
       "risk_class": "low",
       "implementation_type": "declarative",
@@ -381,6 +392,180 @@
       "risk_class": "medium",
       "implementation_type": "declarative",
       "implementation_ref": "subagent_delete"
+    },
+    {
+      "tool_name": "task_move",
+      "description": "Move a task card to another board column: analysis, todo, in_progress or done. Moving is only organizational and never starts work.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "Task id"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "analysis",
+              "todo",
+              "in_progress",
+              "done"
+            ],
+            "description": "Target column"
+          }
+        },
+        "required": [
+          "task_id",
+          "stage"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_move"
+    },
+    {
+      "tool_name": "task_assign",
+      "description": "Assign a task to yourself for immediate execution: moves it to in_progress and queues a run. Use when the user asks you to do the work now, or to delegate it to a parallel run. It fails when the task is blocked by unfinished linked tasks.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "Task id"
+          }
+        },
+        "required": [
+          "task_id"
+        ]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_assign"
+    },
+    {
+      "tool_name": "task_note",
+      "description": "Write a note on a task card: decisions, findings, or progress the user must see later.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "Task id"
+          },
+          "body": {
+            "type": "string",
+            "description": "Note text"
+          }
+        },
+        "required": [
+          "task_id",
+          "body"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_note"
+    },
+    {
+      "tool_name": "task_link",
+      "description": "Reference another task from this one. Use kind 'blocks' when the other task must finish first, 'relates' otherwise.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "Task being annotated"
+          },
+          "related_task_id": {
+            "type": "string",
+            "description": "The other task"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "blocks",
+              "relates"
+            ]
+          }
+        },
+        "required": [
+          "task_id",
+          "related_task_id"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_link"
+    },
+    {
+      "tool_name": "task_unlink",
+      "description": "Remove a reference between tasks.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "Task id"
+          },
+          "link_id": {
+            "type": "string",
+            "description": "Link id"
+          }
+        },
+        "required": [
+          "task_id",
+          "link_id"
+        ]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "task_unlink"
+    },
+    {
+      "tool_name": "project_create",
+      "description": "Create a project to group tasks. Tasks in different projects do not interfere.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Project name (unique per user)"
+          },
+          "description": {
+            "type": "string",
+            "description": "What the project is about"
+          },
+          "color": {
+            "type": "string",
+            "enum": [
+              "blue",
+              "green",
+              "purple",
+              "orange",
+              "pink",
+              "gray"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "project_create"
+    },
+    {
+      "tool_name": "project_list",
+      "description": "List the user's projects with their task counts. Call this before creating tasks when the project is not obvious.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "project_list"
     }
   ]
 }

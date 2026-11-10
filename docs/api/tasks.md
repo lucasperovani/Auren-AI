@@ -18,6 +18,14 @@ Tasks are persistent, schedulable units of work. A task run is one execution of 
 | POST | `/api/v1/tasks/{task_id}/resume` | Resume future executions |
 | POST | `/api/v1/tasks/{task_id}/cancel` | Cancel active work where possible |
 | POST | `/api/v1/tasks/{task_id}/stage` | Move a task to another board column |
+| POST | `/api/v1/tasks/{task_id}/assign` | Assign the task to the agent and start a run |
+| GET | `/api/v1/tasks/{task_id}/notes` | Notes on the card |
+| POST | `/api/v1/tasks/{task_id}/notes` | Add a note |
+| DELETE | `/api/v1/tasks/{task_id}/notes/{note_id}` | Delete a note |
+| GET | `/api/v1/tasks/{task_id}/links` | References to and from the card |
+| POST | `/api/v1/tasks/{task_id}/links` | Link another task |
+| DELETE | `/api/v1/tasks/{task_id}/links/{link_id}` | Remove a link |
+| GET | `/api/v1/tasks/{task_id}/activity` | Chronological timeline of notes, runs, and tool calls |
 | GET | `/api/v1/tasks/{task_id}/runs` | List execution history |
 | GET | `/api/v1/tasks/{task_id}/schedule` | Retrieve scheduling information |
 | PUT | `/api/v1/tasks/{task_id}/schedule` | Update scheduling information |
@@ -68,6 +76,40 @@ Movement:
   sits, so moving a card cannot silently pause work.
 - Unknown stages return `422`; reopening a closed task (`completed`/`cancelled`)
   returns `409`.
+
+### Assigning work
+
+`POST /tasks/{task_id}/assign` is the **only** stage change that starts work: it
+moves the card to `in_progress` and queues a run. Dragging a card never runs
+anything, so an accidental drop costs nothing.
+
+- The UI asks for confirmation when a card lands in To Do; dismissing the
+  dialog leaves it there without running.
+- Assignment fails with `409` when a `blocks` link points at unfinished work,
+  naming the blocking card. The card stays where it was.
+- The agent uses `task_assign` for the same operation when it decides to do the
+  work itself or delegate it to a parallel run.
+
+### Projects
+
+Tasks belong to an optional project (`project_id`, `project_name`). Boards,
+listings, and the agent's `task_list` are scoped by project, so work on one
+project does not interfere with another. Tasks without a project live on the
+default board and are selected with `?project_id=none`.
+
+Deleting a project detaches its tasks (`project_id = NULL`) instead of deleting
+them.
+
+### Notes and links
+
+- Notes (`author` is `user` or `agent`) hold the running context of a card,
+  separate from the objective, which stays the stable instruction.
+- Links point from one task to another with `kind` `blocks` or `relates`.
+  `A blocks B` means A must finish before B; `GET /links` returns `outgoing`
+  and `incoming`, so both sides render. Self-links and re-linking the same pair
+  are handled explicitly (rejected and idempotent respectively).
+- `GET /activity` returns notes, runs, and tool steps in one chronological
+  list, which is what the card detail shows under "What the agent did".
 
 ## Task runs
 

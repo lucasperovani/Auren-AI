@@ -789,6 +789,8 @@ const TASK_FILTERS = [
 ];
 
 let taskFilter = sessionStorage.getItem('auren_task_filter') || 'all';
+// Which project board is open; empty string means the default board.
+let currentProjectId = sessionStorage.getItem('auren_project') || '';
 // Board state survives navigation: which columns are collapsed.
 let collapsedColumns = new Set(
   (sessionStorage.getItem('auren_kanban_collapsed') || '').split(',').filter(Boolean),
@@ -826,10 +828,18 @@ function taskTimingHtml(task) {
 }
 
 views.tasks = async (content) => {
-  const [agents, { items }] = await Promise.all([
+  const [agents, projects, { items }] = await Promise.all([
     api('GET', '/agents'),
-    api('GET', '/tasks?limit=200'),
+    api('GET', '/projects'),
+    api('GET', `/tasks?limit=200&project_id=${encodeURIComponent(currentProjectId || 'none')}`),
   ]);
+
+  // A remembered project may have been deleted: fall back to the default board.
+  if (currentProjectId && !projects.items.some((p) => p.id === currentProjectId)) {
+    currentProjectId = '';
+    sessionStorage.removeItem('auren_project');
+  }
+  const currentProject = projects.items.find((p) => p.id === currentProjectId) || null;
 
   const activeFilter = TASK_FILTERS.find((f) => f.id === taskFilter) || TASK_FILTERS[0];
   const visible = activeFilter.statuses
@@ -845,22 +855,53 @@ views.tasks = async (content) => {
 
   content.innerHTML = `
     ${pageHead(
-      'Tasks',
-      'Drag cards between columns to track work. Columns are independent of scheduling: a scheduled task keeps firing wherever it sits.',
-      '<button class="btn" id="task-new">+ New task</button>',
+      currentProject ? currentProject.name : 'Tasks',
+      currentProject
+        ? (currentProject.description || 'Tasks in this project are isolated from other projects.')
+        : 'Drag cards between columns to track work. Columns are independent of scheduling: a scheduled task keeps firing wherever it sits.',
+      `
+        <button class="btn btn-secondary" id="project-new">+ New project</button>
+        <button class="btn" id="task-new">+ New task</button>
+      `,
     )}
+    <div class="project-bar">
+      <button class="project-chip ${currentProjectId ? '' : 'active'}" data-project="">
+        <span class="project-dot" style="background:var(--muted)"></span>
+        Default board
+      </button>
+      ${projects.items.map((p) => `
+        <button class="project-chip ${p.id === currentProjectId ? 'active' : ''}" data-project="${esc(p.id)}">
+          <span class="project-dot project-${esc(p.color)}"></span>
+          ${esc(p.name)}
+          <span class="project-chip-count">${p.task_count}</span>
+        </button>`).join('')}
+    </div>
     <div class="task-toolbar">
       ${counts.map((f) => `
         <button class="filter-chip ${f.id === activeFilter.id ? 'active' : ''}" data-filter="${f.id}">
           ${esc(f.label)}${f.count ? ` · ${f.count}` : ''}
         </button>`).join('')}
       <span class="spacer"></span>
+      ${currentProject ? `<button class="btn btn-sm btn-secondary" id="project-edit">Project settings</button>` : ''}
       <button class="btn btn-sm btn-secondary" id="kanban-expand-all">Expand all</button>
     </div>
     <div class="kanban" id="kanban">
       ${KANBAN_COLUMNS.map((col) => kanbanColumnHtml(col, visible.filter((t) => (t.stage || 'todo') === col.id))).join('')}
     </div>
   `;
+
+  // Project switcher.
+  content.querySelectorAll('[data-project]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      currentProjectId = chip.dataset.project;
+      if (currentProjectId) sessionStorage.setItem('auren_project', currentProjectId);
+      else sessionStorage.removeItem('auren_project');
+      navigate('tasks');
+    });
+  });
+  document.getElementById('project-new').addEventListener('click', () => showProjectForm(null));
+  const projectEdit = document.getElementById('project-edit');
+  if (projectEdit) projectEdit.addEventListener('click', () => showProjectForm(currentProject));
 
   // Filter chips.
   content.querySelectorAll('[data-filter]').forEach((chip) => {
@@ -901,6 +942,14 @@ views.tasks = async (content) => {
   content.querySelectorAll('.kanban-card').forEach((card) => {
     const task = items.find((t) => t.id === card.dataset.id);
     if (!task) return;
+    // Clicking the card body opens the detail; controls keep their own handlers.
+    card.addEventListener('click', (event) => {
+      if (event.target.closest('button')) return;
+      openTaskDetail(task.id);
+    });
+    card.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && event.target === card) openTaskDetail(task.id);
+    });
     card.querySelectorAll('[data-action]').forEach((btn) => {
       btn.addEventListener('click', async (event) => {
         // Buttons inside a draggable card must not start a drag.
@@ -1052,6 +1101,11 @@ function wireKanbanDrag(content, tasks) {
         await api('POST', `/tasks/${taskId}/stage`, { stage: column });
         toast(`Moved to ${KANBAN_COLUMNS.find((c) => c.id === column)?.label || column}`, 'success');
         navigate('tasks');
+        // Landing in To Do is the moment work becomes runnable: offer to hand
+        // it to the agent. Dismissing the dialog leaves it in To Do.
+        if (column === 'todo' && task.stage !== 'todo') {
+          showAssignDialog({ ...task, stage: 'todo' });
+        }
       } catch (err) {
         toast(err.message, 'error');
         navigate('tasks');
@@ -1083,6 +1137,382 @@ function wireKanbanDrag(content, tasks) {
         .catch((err) => toast(err.message, 'error'));
     });
   });
+}
+
+/**
+ * Assignment dialog shown after a card lands in To Do.
+ *
+ * This is the only place where moving a card can start work, and it is always
+ * opt-in: dismissing the dialog (clicking outside or Cancel) leaves the card
+ * in To Do without running anything.
+ */
+function showAssignDialog(task) {
+  const modal = openModal({
+    title: 'Assign this task to the agent?',
+    bodyHtml: `
+      <p class="muted" style="font-size:.9rem;margin-bottom:14px">
+        The agent will start working on this task now. Nothing runs unless you confirm.
+      </p>
+      <div class="assign-summary">
+        <div class="assign-title">${esc(task.title)}</div>
+        <div class="muted" style="font-size:.85rem">${esc(task.objective)}</div>
+      </div>
+      <div class="assign-meta muted">
+        ${esc(taskScheduleLabel(task))}
+        ${task.project_name ? ` · ${esc(task.project_name)}` : ''}
+      </div>
+    `,
+    footerHtml: `
+      <button class="btn btn-secondary" data-close>Keep in To Do</button>
+      <button class="btn" id="assign-confirm">Assign to the agent</button>
+    `,
+  });
+
+  const confirmBtn = modal.root.querySelector('#assign-confirm');
+  confirmBtn.addEventListener('click', async () => {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Assigning…';
+    try {
+      await api('POST', `/tasks/${task.id}/assign`, {});
+      modal.close();
+      toast('Assigned — the agent is starting now', 'success');
+      openTaskDetail(task.id);
+    } catch (err) {
+      // A blocked task cannot be started: say which card is in the way.
+      toast(err.message, 'error');
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Assign to the agent';
+    }
+  });
+}
+
+/** Project create/edit dialog. */
+function showProjectForm(project) {
+  const isEdit = Boolean(project);
+  const colors = ['blue', 'green', 'purple', 'orange', 'pink', 'gray'];
+  const modal = openModal({
+    title: isEdit ? 'Project settings' : 'New project',
+    bodyHtml: `
+      <div class="form-row">
+        <label class="field-label" for="project-name">Name</label>
+        <input id="project-name" placeholder="Website redesign" value="${esc(project?.name || '')}">
+      </div>
+      <div class="form-row">
+        <label class="field-label" for="project-description">Description</label>
+        <textarea id="project-description" placeholder="What is this project about?">${esc(project?.description || '')}</textarea>
+      </div>
+      <div class="form-row">
+        <label class="field-label" for="project-color">Color</label>
+        <select id="project-color">
+          ${colors.map((c) => `<option value="${c}" ${project?.color === c ? 'selected' : ''}>${c}</option>`).join('')}
+        </select>
+        <p class="field-hint">Tasks in different projects never interfere with each other.</p>
+      </div>
+    `,
+    footerHtml: `
+      ${isEdit ? '<button class="btn btn-danger" id="project-delete">Delete project</button>' : ''}
+      <span class="spacer"></span>
+      <button class="btn btn-secondary" data-close>Cancel</button>
+      <button class="btn" id="project-save">${isEdit ? 'Save' : 'Create project'}</button>
+    `,
+  });
+
+  const root = modal.root;
+  root.querySelector('#project-save').addEventListener('click', async () => {
+    const name = root.querySelector('#project-name').value.trim();
+    const description = root.querySelector('#project-description').value.trim();
+    const color = root.querySelector('#project-color').value;
+    if (!name) { toast('Project name is required', 'error'); return; }
+
+    const saveBtn = root.querySelector('#project-save');
+    saveBtn.disabled = true;
+    try {
+      if (isEdit) {
+        await api('PATCH', `/projects/${project.id}`, { name, description, color });
+        toast('Project updated', 'success');
+      } else {
+        const created = await api('POST', '/projects', { name, description, color });
+        currentProjectId = created.id;
+        sessionStorage.setItem('auren_project', currentProjectId);
+        toast('Project created', 'success');
+      }
+      modal.close();
+      navigate('tasks');
+    } catch (err) {
+      toast(err.message, 'error');
+      saveBtn.disabled = false;
+    }
+  });
+
+  const deleteBtn = root.querySelector('#project-delete');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', async () => {
+      if (!confirm(`Delete "${project.name}"? Its tasks are kept and moved to the default board.`)) return;
+      try {
+        await api('DELETE', `/projects/${project.id}`);
+        currentProjectId = '';
+        sessionStorage.removeItem('auren_project');
+        modal.close();
+        toast('Project deleted; its tasks moved to the default board', 'success');
+        navigate('tasks');
+      } catch (err) { toast(err.message, 'error'); }
+    });
+  }
+}
+
+/**
+ * Card detail: what the task is, what it is linked to, and what the agent
+ * actually did. This is the "open the task" view.
+ */
+async function openTaskDetail(taskId) {
+  const modal = openModal({
+    title: 'Task',
+    bodyHtml: '<div class="muted">Loading…</div>',
+  });
+  const body = modal.root.querySelector('.modal-body');
+
+  let detail;
+  try {
+    [detail] = await Promise.all([api('GET', `/tasks/${taskId}`)]);
+  } catch (err) {
+    body.innerHTML = `<p class="error">Failed to load the task: ${esc(err.message)}</p>`;
+    return;
+  }
+  modal.root.querySelector('h3').textContent = detail.title;
+
+  body.innerHTML = `
+    <div class="detail-tabs">
+      <button class="detail-tab active" data-tab="overview">Overview</button>
+      <button class="detail-tab" data-tab="activity">What the agent did</button>
+      <button class="detail-tab" data-tab="runs">Runs</button>
+    </div>
+    <div class="detail-panel" id="detail-panel"><div class="muted">Loading…</div></div>
+  `;
+
+  const panel = body.querySelector('#detail-panel');
+
+  const renderOverview = async () => {
+    panel.innerHTML = '<div class="muted">Loading…</div>';
+    try {
+      const links = await api('GET', `/tasks/${taskId}/links`);
+      const notes = await api('GET', `/tasks/${taskId}/notes`);
+      const candidates = await api(
+        'GET',
+        `/tasks?limit=100&project_id=${encodeURIComponent(detail.project_id || 'none')}`,
+      );
+      const others = candidates.items.filter((t) => t.id !== taskId);
+
+      panel.innerHTML = `
+        <dl class="kv">
+          <dt>Project</dt>
+          <dd>${detail.project_name ? esc(detail.project_name) : 'Default board'}</dd>
+          <dt>Column</dt>
+          <dd><span class="badge plain ${esc(detail.stage)}">${esc(detail.stage.replace('_', ' '))}</span></dd>
+          <dt>Schedule</dt>
+          <dd>${esc(taskScheduleLabel(detail))}</dd>
+          <dt>Next run</dt>
+          <dd>${detail.next_run_at ? esc(formatDateTime(detail.next_run_at)) : '—'}</dd>
+          <dt>Objective</dt>
+          <dd class="detail-objective">${esc(detail.objective)}</dd>
+        </dl>
+
+        <h4 class="detail-section">Linked tasks</h4>
+        ${renderLinkList(links)}
+
+        <h4 class="detail-section">Notes</h4>
+        <div class="note-list">
+          ${notes.items.length
+            ? notes.items.map((n) => `
+              <div class="note ${n.author === 'agent' ? 'from-agent' : 'from-user'}">
+                <div class="note-head">
+                  <span class="note-author">${n.author === 'agent' ? 'Agent' : 'You'}</span>
+                  <span class="muted">${esc(relativeTime(n.created_at))}</span>
+                </div>
+                <div class="note-body">${esc(n.body)}</div>
+              </div>`).join('')
+            : '<div class="muted" style="font-size:.85rem">No notes yet.</div>'}
+        </div>
+        <div class="form-row" style="margin-top:10px">
+          <textarea id="note-body" placeholder="Add a note…" style="min-height:64px"></textarea>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-sm" id="note-add">Add note</button>
+            <span class="spacer"></span>
+            <select id="link-target" style="max-width:230px">
+              <option value="">Link another task…</option>
+              ${others.map((t) => `<option value="${esc(t.id)}">${esc(t.title)}</option>`).join('')}
+            </select>
+            <select id="link-kind" style="max-width:180px">
+              <option value="relates">relates to</option>
+              <option value="blocked_by">is blocked by</option>
+              <option value="blocks">blocks</option>
+            </select>
+            <button class="btn btn-sm btn-secondary" id="link-add">Link</button>
+          </div>
+        </div>
+      `;
+
+      panel.querySelector('#note-add').addEventListener('click', async () => {
+        const text = panel.querySelector('#note-body').value.trim();
+        if (!text) { toast('Write something first', 'error'); return; }
+        try {
+          await api('POST', `/tasks/${taskId}/notes`, { body: text });
+          toast('Note added', 'success');
+          renderOverview();
+        } catch (err) { toast(err.message, 'error'); }
+      });
+
+      panel.querySelector('#link-add').addEventListener('click', async () => {
+        const target = panel.querySelector('#link-target').value;
+        const kind = panel.querySelector('#link-kind').value;
+        if (!target) { toast('Pick a task to link', 'error'); return; }
+        try {
+          // "is blocked by" is stored as the blocker blocking this task, which
+          // keeps a single direction in the table.
+          if (kind === 'blocked_by') {
+            await api('POST', `/tasks/${target}/links`, { to_task_id: taskId, kind: 'blocks' });
+          } else {
+            await api('POST', `/tasks/${taskId}/links`, { to_task_id: target, kind });
+          }
+          toast('Tasks linked', 'success');
+          renderOverview();
+        } catch (err) { toast(err.message, 'error'); }
+      });
+
+      panel.querySelectorAll('[data-unlink]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          try {
+            await api('DELETE', `/tasks/${taskId}/links/${btn.dataset.unlink}`);
+            renderOverview();
+          } catch (err) { toast(err.message, 'error'); }
+        });
+      });
+    } catch (err) {
+      panel.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    }
+  };
+
+  const renderActivity = async () => {
+    panel.innerHTML = '<div class="muted">Loading…</div>';
+    try {
+      const { items } = await api('GET', `/tasks/${taskId}/activity`);
+      panel.innerHTML = items.length
+        ? `<div class="timeline">${items.map(activityItemHtml).join('')}</div>`
+        : '<div class="muted">The agent has not worked on this task yet.</div>';
+    } catch (err) {
+      panel.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    }
+  };
+
+  const renderRuns = async () => {
+    panel.innerHTML = '<div class="muted">Loading…</div>';
+    try {
+      const { items: runs } = await api('GET', `/tasks/${taskId}/runs?limit=20`);
+      panel.innerHTML = runs.length
+        ? runs.map((run) => `
+          <details class="run-entry">
+            <summary>
+              <span class="badge ${esc(run.status)}">${esc(run.status)}</span>
+              <span class="muted" style="font-size:.83rem">
+                ${esc(run.trigger)} · ${esc(formatDateTime(run.started_at || run.created_at))}
+              </span>
+              ${formatDuration(run.started_at, run.finished_at)
+                ? `<span class="run-time">${esc(formatDuration(run.started_at, run.finished_at))}</span>` : ''}
+            </summary>
+            <div class="run-step-body">
+              ${run.result ? `<div><strong>Result</strong></div><pre>${esc(JSON.stringify(run.result, null, 2))}</pre>` : ''}
+              ${run.error_message ? `<div class="error">${esc(run.error_message)}</div>` : ''}
+            </div>
+          </details>`).join('')
+        : '<div class="muted">No runs yet.</div>';
+    } catch (err) {
+      panel.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    }
+  };
+
+  const tabs = { overview: renderOverview, activity: renderActivity, runs: renderRuns };
+  body.querySelectorAll('[data-tab]').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      body.querySelectorAll('[data-tab]').forEach((t) => t.classList.toggle('active', t === tab));
+      tabs[tab.dataset.tab]();
+    });
+  });
+  renderOverview();
+}
+
+/** Linked tasks with a remove control per link, and the direction spelled out. */
+function renderLinkList(links) {
+  const rows = [
+    ...(links.incoming || []).map((l) => ({
+      ...l,
+      direction: l.kind === 'blocks' ? 'blocked by' : 'referenced by',
+      blocking: l.kind === 'blocks',
+    })),
+    ...(links.outgoing || []).map((l) => ({
+      ...l,
+      direction: l.kind === 'blocks' ? 'blocks' : 'references',
+      blocking: false,
+    })),
+  ];
+  if (!rows.length) {
+    return '<div class="muted" style="font-size:.85rem">No linked tasks.</div>';
+  }
+  return `<div class="link-list">${rows.map((l) => `
+    <div class="link-row">
+      <span class="link-icon">${l.blocking ? '⛓' : '↔'}</span>
+      <span class="link-direction muted">${esc(l.direction)}</span>
+      <button class="link-target" data-open-task="${esc(l.task_id)}">${esc(l.title)}</button>
+      <span class="badge plain ${esc(l.stage)}">${esc(l.stage.replace('_', ' '))}</span>
+      <span class="spacer"></span>
+      <button class="btn-icon danger" data-unlink="${esc(l.id)}" title="Remove link">✕</button>
+    </div>`).join('')}</div>`;
+}
+
+/** One entry of the activity timeline. */
+function activityItemHtml(item) {
+  if (item.kind === 'note') {
+    return `
+      <div class="timeline-item note ${item.author === 'agent' ? 'from-agent' : 'from-user'}">
+        <div class="timeline-head">
+          <span class="timeline-dot"></span>
+          <strong>${item.author === 'agent' ? 'Agent note' : 'Your note'}</strong>
+          <span class="spacer"></span>
+          <span class="muted">${esc(relativeTime(item.created_at))}</span>
+        </div>
+        <div class="timeline-body">${esc(item.body)}</div>
+      </div>`;
+  }
+  if (item.kind === 'run') {
+    return `
+      <div class="timeline-item run">
+        <div class="timeline-head">
+          <span class="timeline-dot"></span>
+          <strong>Run ${esc(item.trigger)}</strong>
+          <span class="badge ${esc(item.status)} plain">${esc(item.status)}</span>
+          <span class="spacer"></span>
+          <span class="muted">${esc(relativeTime(item.started_at || item.created_at))}</span>
+        </div>
+        ${item.error_message ? `<div class="timeline-body error">${esc(item.error_message)}</div>` : ''}
+      </div>`;
+  }
+  // A tool call: the concrete work performed.
+  const statusIcon = item.status === 'completed' ? '✓' : item.status === 'failed' ? '✗' : '…';
+  return `
+    <div class="timeline-item step">
+      <div class="timeline-head">
+        <span class="timeline-dot"></span>
+        <strong>Step ${esc(item.step_index)}</strong>
+        <code class="mono">${esc(item.tool || 'tool')}</code>
+        <span class="badge ${esc(item.status)} plain">${statusIcon} ${esc(item.status)}</span>
+        <span class="spacer"></span>
+        <span class="muted">${esc(relativeTime(item.created_at))}</span>
+      </div>
+      <details class="timeline-details">
+        <summary>Parameters and output</summary>
+        <pre>${esc(JSON.stringify(item.input, null, 2))}</pre>
+        ${item.output ? `<pre>${esc(JSON.stringify(item.output, null, 2))}</pre>` : ''}
+        ${item.error_message ? `<div class="error">${esc(item.error_message)}</div>` : ''}
+      </details>
+    </div>`;
 }
 
 /**
@@ -1174,6 +1604,8 @@ function showTaskForm(task, agents) {
     if (choice === '__custom' && !cron) { toast('Enter a cron expression or pick a preset', 'error'); return; }
 
     const body = { title, objective, agent_id: agentId };
+    // New tasks join the board the user is looking at.
+    if (!isEdit && currentProjectId) body.project_id = currentProjectId;
     // `schedule: null` explicitly removes an existing schedule; omitting it
     // would leave the old cron in place.
     body.schedule = cron ? { cron } : null;

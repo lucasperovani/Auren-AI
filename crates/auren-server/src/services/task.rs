@@ -53,6 +53,7 @@ impl TaskService {
         schedule: Option<&serde_json::Value>,
         timezone: &str,
         conversation_id: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<String, ApiError> {
         if title.trim().is_empty() || objective.trim().is_empty() {
             return Err(ApiError::Unprocessable("title and objective are required".into()));
@@ -81,8 +82,8 @@ impl TaskService {
 
         let mut tx = self.db.begin().await.map_err(ApiError::from)?;
         sqlx::query(
-            "INSERT INTO tasks (id, user_id, agent_id, conversation_id, title, objective, status, stage, schedule_json, timezone, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, user_id, agent_id, conversation_id, title, objective, status, stage, project_id, schedule_json, timezone, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(user_id)
@@ -92,6 +93,7 @@ impl TaskService {
         .bind(objective.trim())
         .bind(status)
         .bind(stage)
+        .bind(project_id)
         .bind(schedule.map(|s| s.to_string()))
         .bind(timezone)
         .bind(&now)
@@ -423,7 +425,7 @@ mod tests {
         let (user, agent) = seed_user_agent(&s).await;
         let svc = TaskService::new(&s);
         let schedule = json!({ "cron": "*/5 * * * *" });
-        let id = svc.create(&user, &agent, "T", "O", Some(&schedule), "UTC", None).await.unwrap();
+        let id = svc.create(&user, &agent, "T", "O", Some(&schedule), "UTC", None, None).await.unwrap();
         let row = sqlx::query("SELECT status FROM tasks WHERE id = ?").bind(&id).fetch_one(&s.db).await.unwrap();
         assert_eq!(row.get::<String, _>("status"), "active");
         let job = sqlx::query("SELECT status FROM scheduled_jobs WHERE task_id = ?").bind(&id).fetch_one(&s.db).await.unwrap();
@@ -436,7 +438,7 @@ mod tests {
         let (user, agent) = seed_user_agent(&s).await;
         let svc = TaskService::new(&s);
         let schedule = json!({ "cron": "not a cron" });
-        assert!(svc.create(&user, &agent, "T", "O", Some(&schedule), "UTC", None).await.is_err());
+        assert!(svc.create(&user, &agent, "T", "O", Some(&schedule), "UTC", None, None).await.is_err());
     }
 
     #[tokio::test]
@@ -444,7 +446,7 @@ mod tests {
         let s = state().await;
         let (user, agent) = seed_user_agent(&s).await;
         let svc = TaskService::new(&s);
-        let id = svc.create(&user, &agent, "T", "O", None, "UTC", None).await.unwrap();
+        let id = svc.create(&user, &agent, "T", "O", None, "UTC", None, None).await.unwrap();
         // Another user cannot see or run the task.
         assert!(svc.require_owned("u2", &id).await.is_err());
         assert!(svc.request_run("u2", &id).await.is_err());

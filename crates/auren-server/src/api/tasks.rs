@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/{task_id}/resume", post(resume_task))
         .route("/{task_id}/cancel", post(cancel_task))
         .route("/{task_id}/stage", post(move_task_stage))
+        .route("/{task_id}/assign", post(assign_task))
         .route("/{task_id}/runs", get(list_runs))
         .route("/{task_id}/schedule", get(get_schedule).put(put_schedule))
         .route("/{task_id}/steps", get(get_steps))
@@ -37,6 +38,8 @@ pub struct ListParams {
     pub cursor: Option<String>,
     pub status: Option<String>,
     pub agent_id: Option<String>,
+    /// Filter the board by project. `"none"` selects the default board.
+    pub project_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -49,6 +52,9 @@ pub struct TaskResponse {
     pub status: String,
     /// Kanban column: `analysis`, `todo`, `in_progress`, or `done`.
     pub stage: String,
+    /// Owning project, or `null` for the default board.
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
     pub schedule: Option<serde_json::Value>,
     /// Raw cron expression when the task is scheduled. Clients render a
     /// human description; the expression itself is never shown to users.
@@ -66,9 +72,11 @@ pub struct TaskResponse {
 /// Task columns plus the joined schedule and latest run, so list and detail
 /// endpoints agree on the shape consumed by `row_to_task`.
 const TASK_SELECT: &str = "SELECT t.*, j.next_run_at AS next_run_at, \
+     p.name AS project_name, \
      r.status AS last_run_status, r.created_at AS last_run_at \
      FROM tasks t \
      LEFT JOIN scheduled_jobs j ON j.task_id = t.id AND j.status = 'active' \
+     LEFT JOIN projects p ON p.id = t.project_id \
      LEFT JOIN task_runs r ON r.id = (\
          SELECT id FROM task_runs WHERE task_id = t.id ORDER BY created_at DESC LIMIT 1\
      )";
@@ -90,6 +98,8 @@ fn row_to_task(r: &sqlx::sqlite::SqliteRow) -> TaskResponse {
         objective: r.get("objective"),
         status: r.get("status"),
         stage: r.try_get("stage").unwrap_or_else(|_| "todo".to_string()),
+        project_id: r.try_get("project_id").ok().flatten(),
+        project_name: r.try_get("project_name").ok().flatten(),
         schedule,
         schedule_cron,
         next_run_at: r.try_get("next_run_at").ok().flatten(),
@@ -116,6 +126,13 @@ pub async fn list_tasks(
     if params.agent_id.is_some() {
         sql.push_str(" AND t.agent_id = ?");
     }
+    // Project scoping: an explicit id narrows the board, `none` selects only
+    // tasks without a project, and no value returns everything.
+    match params.project_id.as_deref() {
+        Some("none") => sql.push_str(" AND t.project_id IS NULL"),
+        Some(_) => sql.push_str(" AND t.project_id = ?"),
+        None => {}
+    }
     sql.push_str(" AND t.id > ? ORDER BY t.id LIMIT ?");
 
     let mut query = sqlx::query(&sql).bind(&user.id);
@@ -124,6 +141,9 @@ pub async fn list_tasks(
     }
     if let Some(a) = &params.agent_id {
         query = query.bind(a);
+    }
+    if let Some(p) = params.project_id.as_deref().filter(|p| *p != "none") {
+        query = query.bind(p);
     }
     let cursor_value = cursor.clone().unwrap_or_default();
     query = query.bind(&cursor_value).bind(limit + 1);
@@ -149,6 +169,9 @@ pub struct CreateTaskRequest {
     #[serde(default = "default_timezone")]
     pub timezone: String,
     pub conversation_id: Option<String>,
+    /// Owning project. Omit for the default board.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 fn default_timezone() -> String {
@@ -160,6 +183,12 @@ pub async fn create_task(
     user: AuthUser,
     Json(req): Json<CreateTaskRequest>,
 ) -> ApiResult<(axum::http::StatusCode, Json<TaskResponse>)> {
+    // A project must belong to the caller before a task can join it.
+    if let Some(project_id) = req.project_id.as_deref() {
+        crate::services::projects::ProjectService::new(&state)
+            .require_owned(&user.id, project_id)
+            .await?;
+    }
     let svc = TaskService::new(&state);
     let id = svc
         .create(
@@ -170,6 +199,7 @@ pub async fn create_task(
             req.schedule.as_ref(),
             &req.timezone,
             req.conversation_id.as_deref(),
+            req.project_id.as_deref(),
         )
         .await?;
     let row = sqlx::query(&format!("{TASK_SELECT} WHERE t.id = ?"))
@@ -267,6 +297,49 @@ pub async fn move_task_stage(
         .fetch_one(&state.db)
         .await?;
     Ok(Json(row_to_task(&row)))
+}
+
+#[derive(Deserialize)]
+pub struct AssignTaskRequest {
+    /// Optional project override when assigning from a project board.
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// Assign a task to the agent for immediate execution: this is what the
+/// assignment dialog confirms. It moves the card to In Progress and queues a
+/// run, which is the only path where a stage change starts work.
+pub async fn assign_task(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(task_id): Path<String>,
+    Json(_req): Json<AssignTaskRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let collab = crate::services::task_collab::TaskCollabService::new(&state);
+    let svc = TaskService::new(&state);
+    svc.require_owned(&user.id, &task_id).await?;
+
+    // Refuse to start work that depends on unfinished cards: the run would
+    // fail or, worse, produce a result based on missing input.
+    let blockers = collab.open_blockers(&task_id).await?;
+    if !blockers.is_empty() {
+        return Err(ApiError::Conflict(format!(
+            "this task is blocked by unfinished work: {}",
+            blockers.join(", ")
+        )));
+    }
+
+    svc.set_stage(&user.id, &task_id, "in_progress").await?;
+    let run_id = svc.request_run(&user.id, &task_id).await?;
+    let row = sqlx::query(&format!("{TASK_SELECT} WHERE t.id = ?"))
+        .bind(&task_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(json!({
+        "task": row_to_task(&row),
+        "task_run_id": run_id,
+        "status": "assigned",
+    })))
 }
 
 /// Permanently delete a task: cancels active work, removes the schedule,
