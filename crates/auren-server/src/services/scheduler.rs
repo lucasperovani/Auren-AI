@@ -319,10 +319,10 @@ mod tests {
     #[test]
     fn next_run_step_and_list() {
         let next = next_run_at(&cron("*/15 * * * *")).unwrap();
-        assert!(next.minute() % 15 == 0);
+        assert!(next.minute().is_multiple_of(15));
 
         let next = next_run_at(&cron("0,30 * * * *")).unwrap();
-        assert!(next.minute() == 0 || next.minute() == 30);
+        assert!(next.minute().is_multiple_of(30));
     }
 
     #[test]
