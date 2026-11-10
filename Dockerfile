@@ -33,42 +33,35 @@ RUN apk add --no-cache musl-dev perl make git ca-certificates \
 WORKDIR /build
 
 # ---------------------------------------------------------------------------
-# Dependency cache
+# Build with Cargo's output kept OUT of the image layers
 #
-# Compiling the dependency graph takes several minutes and only changes when a
-# manifest changes. Manifests are copied first and the crate is built against a
-# stub source, so this layer is reused until Cargo.toml/Cargo.lock change — a
-# code-only change then recompiles just this crate.
+# The `target/` directory of a release build is several GB. With the `vfs`
+# storage driver every layer is a *full copy* of the rootfs, so a multi-GB
+# target directory left in a layer gets copied once per following instruction
+# and exhausts the runner disk ("no space left on device").
 #
-# A stub `main.rs` satisfies `cargo build -p auren-server` while the real
-# sources are still absent; the dependencies get compiled and cached.
+# Mounting `target/` as a cache keeps it on a host directory instead, so layers
+# only ever contain the final binary. The cache is keyed by mount path and
+# survives between builds, which also preserves the compiled dependency graph —
+# that is what the old stub-source trick was for, done properly.
+#
+# The binary is copied to `/out` in the same RUN because a cache mount is not
+# part of the resulting image: it cannot be COPYed from afterwards.
 # ---------------------------------------------------------------------------
 COPY Cargo.toml Cargo.lock ./
-COPY crates/auren-server/Cargo.toml ./crates/auren-server/Cargo.toml
-
-RUN mkdir -p crates/auren-server/src \
-    && printf 'fn main() {}\n' > crates/auren-server/src/main.rs \
-    && : > crates/auren-server/src/lib.rs \
-    && RUSTFLAGS="-C target-feature=+crt-static" \
-       cargo build --release --target ${TARGET} -p auren-server
-
-# Remove the stub artifacts so the real build cannot reuse them. The dependency
-# artifacts stay cached, which is the whole point.
-RUN rm -rf crates/auren-server/src \
-    target/${TARGET}/release/deps/auren_server* \
-    target/${TARGET}/release/auren-server \
-    target/${TARGET}/release/auren-server.d
-
-# Real sources. Everything above is now cached.
+# Sources must be present before the build, and migrations are embedded at
+# compile time by sqlx::migrate!, so they are copied here too.
 COPY crates ./crates
-# Migrations are embedded at compile time by sqlx::migrate!, so they must be
-# present before the build, not after it.
 COPY migrations ./migrations
 
 # LTO + opt-level=z + panic=abort + symbol stripping come from the release
 # profile in Cargo.toml, so the output is already the smallest codegen.
-RUN RUSTFLAGS="-C target-feature=+crt-static" \
-    cargo build --release --target ${TARGET} -p auren-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release --target ${TARGET} -p auren-server \
+ && mkdir -p /out \
+ && cp "target/${TARGET}/release/auren-server" /out/auren-server
 
 # ---------------------------------------------------------------------------
 # Compression stage: UPX on a static musl binary typically halves it.
@@ -78,9 +71,8 @@ RUN RUSTFLAGS="-C target-feature=+crt-static" \
 # run on the architecture of the binary it compresses.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/arm64 alpine:3.21 AS compress
-ARG TARGET=aarch64-unknown-linux-musl
 RUN apk add --no-cache upx
-COPY --from=builder /build/target/${TARGET}/release/auren-server /auren-server
+COPY --from=builder /out/auren-server /auren-server
 # --best is slow (seconds) but yields the smallest output; lzma is tighter than
 # the default. `--force` is required for static binaries.
 RUN upx --best --lzma --force /auren-server
@@ -111,7 +103,8 @@ COPY --from=compress /auren-server /app/auren-server
 COPY frontend /static
 # Built-in skill packages are read at runtime when a user installs one.
 COPY skills /app/skills
-COPY --from=builder /build/migrations /app/migrations
+# Migrations are NOT copied: `sqlx::migrate!` embeds them in the binary at
+# compile time, so shipping the directory again would only duplicate data.
 
 ENV APP_INSTANCE_NAME=auren \
     APP_HOSTNAME=auren \

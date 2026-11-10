@@ -1,4 +1,8 @@
 target/
+# Buildah's store and cache mounts, when the build runs from a directory that
+# contains them (CI sets BUILDAH_ROOT/TMPDIR inside the project). They hold a
+# full rootfs copy per layer and must never be sent as build context.
+.buildah/
 .git/
 .gitignore
 .env

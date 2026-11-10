@@ -19,24 +19,30 @@ variables:
   TARGET: aarch64-unknown-linux-musl
   IMAGE_TAG: latest
   # Buildah keeps its store in $HOME by default. Moving it inside the project
-  # directory lets GitLab's cache carry images and layer cache between jobs.
+  # directory keeps everything on the runner's working disk.
   #
   # These are `buildah --root` / `--runroot` values, not storage.conf options:
   # passing `graphroot` through STORAGE_OPTS fails with
   # `unknown option "graphroot"`.
   BUILDAH_ROOT: "$CI_PROJECT_DIR/.buildah/storage"
   BUILDAH_RUNROOT: "$CI_PROJECT_DIR/.buildah/runroot"
+  # Cache mounts (`RUN --mount=type=cache`) live under $TMPDIR, not in the
+  # store. Keeping them inside the project directory puts them on the runner's
+  # working disk alongside everything else.
+  TMPDIR: "$CI_PROJECT_DIR/.buildah/tmp"
 
-# Persist buildah's store between jobs. The key follows the two files that
-# actually change the dependency graph, so an unrelated commit reuses the cache
-# while a manifest change starts a fresh one.
-cache:
-  key:
-    files:
-      - Dockerfile
-      - Cargo.lock
-  paths:
-    - .buildah/
+# The Rust dependency cache lives in `RUN --mount=type=cache` (see Dockerfile),
+# not in buildah's store.
+#
+# IMPORTANT: this job used to cache `.buildah/` — the whole buildah store.
+# With the `vfs` driver that store holds a full copy of the rootfs per layer, so
+# restoring it cost more than it saved and the job ran out of disk
+# ("no space left on device").
+#
+# Cache mounts persist on the runner's own disk and never enter a layer, which
+# is the mechanism that fits. They do not survive a pipeline, because each job
+# gets a fresh VM; a from-scratch dependency build takes about 6.5 minutes, which
+# is the accepted cost of not shipping multi-GB caches around.
 
 build-arm64:
   stage: build
@@ -52,23 +58,23 @@ build-arm64:
     BUILDAH_ISOLATION: chroot
   before_script:
     - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    # NOTE: every item is quoted. An unquoted `echo "text: more"`
-    # contains ": " which YAML reads as a key/value separator, turning the
-    # item into a mapping — and GitLab then rejects before_script with
-    # "should be a array of strings".
-    - if [ -d "$BUILDAH_ROOT" ]; then du -sh "$BUILDAH_ROOT"; else echo "cache cold, building from scratch"; fi
+    - mkdir -p "$TMPDIR" "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+    # Surface the runner's disk situation: `no space left on device` mid-build
+    # is otherwise hard to attribute.
+    - df -h "$CI_PROJECT_DIR" | tail -1
   script:
-    # NOTE on caching flags: buildah rejects a tag in `--cache-from` and
-    # `--cache-to` ("repository must contain neither a tag nor digest"),
-    # unlike docker buildx. Both are omitted here.
+    # `--layers` is deliberately NOT used.
     #
-    # Layer reuse comes from the persisted buildah store (`--layers` plus the
-    # `cache:` block above): the Dockerfile is written so a code-only change
-    # reuses the dependency layer, which is where nearly all the time goes.
+    # It caches one intermediate image per instruction, and with the `vfs`
+    # driver each of those is a *full copy* of the rootfs — hundreds of MB to
+    # several GB each. The runner provisions a fresh VM per job, so those layers
+    # are never reused across pipelines: all that disk is spent on nothing.
+    #
+    # Dependency reuse comes from the cache mounts in the Dockerfile instead,
+    # which keep the Cargo registry and `target/` outside the image layers.
     - >
       buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT"
       build
-      --layers
       --build-arg TARGET=$TARGET
       -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
       -f Dockerfile .
@@ -77,6 +83,10 @@ build-arm64:
     - >
       buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT"
       push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+    # Report the final image size; it is the number that matters for deployment.
+    - >
+      buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT"
+      images --format '{{.Name}} {{.Size}}' | grep auren || true
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
