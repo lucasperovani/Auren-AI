@@ -26,6 +26,11 @@ pub async fn execute_builtin(
         "builtin.file_delete" => file_delete(state, args).await,
         "builtin.file_search" => file_search(state, args).await,
         "builtin.web_fetch" => web_fetch(state, args).await,
+        // Web research: search without an API key and read a page as text.
+        "builtin.web_search" => web_search(state, args).await,
+        // Headless navigation for pages rendered by JavaScript.
+        "builtin.web_navigate" => web_navigate(args).await,
+
         // Code editing tools (Copilot-style, operating on the workspace).
         "builtin.code_read_file" => code_read_file(state, args).await,
         "builtin.code_write_file" => code_write_file(state, args).await,
@@ -202,60 +207,53 @@ fn search_recursive(dir: &std::path::Path, query: &str, matches: &mut Vec<Value>
     }
 }
 
-/// Web research: fetch a public URL with SSRF protection (spec section 10.2
-/// and 15: never reach private/internal destinations).
+/// Web research: fetch a public URL and return its readable text.
+///
+/// Delegates to the web_research module, which re-validates every redirect hop
+/// (a public URL cannot bounce into the metadata service), caps the body size,
+/// and converts HTML to text so the model spends its context on content
+/// instead of markup.
 async fn web_fetch(state: &AppState, args: &Value) -> Result<Value, ApiError> {
-    let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("url is required".into()))?;
-    validate_public_url(url)?;
-
-    let response = reqwest::Client::new()
-        .get(url)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::debug!(error = %e, "web fetch failed");
-            ApiError::ServiceUnavailable
-        })?;
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let body = response.text().await.unwrap_or_default();
-    // Truncate large bodies; retrieved content is untrusted input.
-    let truncated: String = body.chars().take(100_000).collect();
-    let _ = state;
-    Ok(json!({
-        "url": url,
-        "status": status,
-        "content_type": content_type,
-        "content": truncated,
-    }))
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::Unprocessable("url is required".into()))?;
+    crate::services::web_research::fetch_page(state, url).await
 }
 
-/// Reject non-http(s) URLs and private/internal destinations (SSRF).
-pub fn validate_public_url(url: &str) -> Result<(), ApiError> {
-    let parsed = url::Url::parse(url).map_err(|_| ApiError::Unprocessable("invalid url".into()))?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(ApiError::Unprocessable("url must be http(s)".into()));
-    }
-    let host = parsed.host_str().unwrap_or_default();
-    if host.is_empty() || host == "localhost" || host.ends_with(".internal") || host.ends_with(".local") {
-        return Err(ApiError::Forbidden("access to internal hosts is not allowed".into()));
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let internal = match ip {
-            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_private(),
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if internal {
-            return Err(ApiError::Forbidden("access to internal addresses is not allowed".into()));
-        }
-    }
-    Ok(())
+/// Web research: render a JavaScript-heavy page in a headless browser.
+///
+/// Used when a plain fetch returns too little text; the browser runs the page's
+/// scripts and the rendered DOM is converted to text the same way.
+async fn web_navigate(args: &Value) -> Result<Value, ApiError> {
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::Unprocessable("url is required".into()))?;
+    crate::services::browser::navigate(url).await
+}
+
+/// Web research: search the web without requiring an API key.
+async fn web_search(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::Unprocessable("query is required".into()))?;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8) as usize;
+
+    let results = crate::services::web_research::search(state, query, limit).await?;
+    Ok(json!({
+        "query": query,
+        "results": results
+            .iter()
+            .map(|r| json!({ "title": r.title, "url": r.url, "snippet": r.snippet }))
+            .collect::<Vec<_>>(),
+        "count": results.len(),
+        "note": "Use web_fetch with a result url to read the page as text.",
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +404,55 @@ const MAX_EXEC_OUTPUT: usize = 100_000;
 /// Hard timeout for command execution.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Program and arguments that run a shell command string on this platform.
+///
+/// The tools are cross-platform, so the shell must be resolved rather than
+/// hard-coded: `sh` does not exist on Windows, and `cmd.exe` does not exist
+/// elsewhere. The returned command already carries the "run this string"
+/// flags, so callers only append the script.
+fn shell_invocation(command: &str) -> tokio::process::Command {
+    if cfg!(windows) {
+        // `cmd /C` is the Windows equivalent of `sh -c`.
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+}
+
+/// Candidate interpreters for running Python, in preference order.
+///
+/// Windows installs expose `python` (and often `py`), while Unix-like systems
+/// use `python3`. Returning a list lets the caller try each one and report a
+/// clear error instead of a bare "No such file or directory".
+fn python_candidates() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["python", "python3", "py"]
+    } else {
+        &["python3", "python"]
+    }
+}
+
+/// Whether a program is available on this host.
+fn program_available(program: &str) -> bool {
+    let path_var = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    let exts: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat"] } else { &[""] };
+    for dir in std::env::split_paths(&path_var) {
+        for ext in exts {
+            if dir.join(format!("{program}{ext}")).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Run a shell command with its working directory set to the workspace.
 async fn exec_shell(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     let command = args
@@ -421,15 +468,14 @@ async fn exec_shell(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     let workspace = state.config.workspace_dir.clone();
     let output = tokio::time::timeout(
         EXEC_TIMEOUT,
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&workspace)
-            .output(),
+        shell_invocation(command).current_dir(&workspace).output(),
     )
     .await
     .map_err(|_| ApiError::Conflict("command timed out after 60s".into()))?
-    .map_err(|e| ApiError::Internal(anyhow::anyhow!("command execution failed: {e}")))?;
+    .map_err(|e| {
+        // A missing shell is a deployment problem, not an agent mistake.
+        ApiError::Internal(anyhow::anyhow!("shell execution unavailable: {e}"))
+    })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     Ok(json!({
@@ -445,7 +491,19 @@ async fn exec_python(state: &AppState, args: &Value) -> Result<Value, ApiError> 
     let file = args.get("file").and_then(|v| v.as_str());
     let workspace = state.config.workspace_dir.clone();
 
-    let mut command = tokio::process::Command::new("python3");
+    // Pick the first interpreter that actually exists on this host.
+    let interpreter = python_candidates()
+        .iter()
+        .copied()
+        .find(|p| program_available(p))
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "no Python interpreter found on this host (looked for: {})",
+                python_candidates().join(", ")
+            ))
+        })?;
+
+    let mut command = tokio::process::Command::new(interpreter);
     command.current_dir(&workspace);
     if let Some(code) = code {
         command.arg("-c").arg(code);
@@ -600,6 +658,13 @@ async fn exec_ssh(state: &AppState, args: &Value) -> Result<Value, ApiError> {
         _ => host.clone(),
     };
     let port_str = port.to_string();
+    // `ssh` is an external program; report its absence clearly instead of
+    // surfacing a raw OS error.
+    if !program_available("ssh") {
+        return Err(ApiError::Conflict(
+            "the `ssh` client is not installed on this host".into(),
+        ));
+    }
     let mut ssh = tokio::process::Command::new("ssh");
     ssh.args([
         "-o", "BatchMode=yes",
@@ -1291,6 +1356,63 @@ mod tests {
         assert!(execute_builtin(&s, "builtin.file_read", &json!({ "path": "notes/a.txt" })).await.is_err());
     }
 
+    #[test]
+    fn shell_invocation_targets_the_platform_shell() {
+        // The tool must work on every OS the release publishes for: `sh` does
+        // not exist on Windows and `cmd` does not exist elsewhere.
+        let cmd = shell_invocation("echo hi");
+        let program = cmd.as_std().get_program().to_string_lossy().to_string();
+        if cfg!(windows) {
+            assert_eq!(program, "cmd");
+            let args: Vec<String> = cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            assert_eq!(args[0], "/C");
+        } else {
+            assert_eq!(program, "sh");
+            let args: Vec<String> = cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            assert_eq!(args[0], "-c");
+        }
+    }
+
+    #[test]
+    fn python_candidates_put_the_platform_binary_first() {
+        let candidates = python_candidates();
+        assert!(!candidates.is_empty());
+        if cfg!(windows) {
+            assert_eq!(candidates[0], "python");
+        } else {
+            assert_eq!(candidates[0], "python3");
+        }
+    }
+
+    #[test]
+    fn program_available_detects_a_known_program() {
+        // Every build host used by CI has a shell available.
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(program_available(shell), "{shell} should be found on PATH");
+        assert!(
+            !program_available("auren-definitely-not-installed"),
+            "unknown programs must not be reported as available"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_shell_runs_a_command_in_the_workspace() {
+        let (s, _d) = state().await;
+        let result = execute_builtin(&s, "builtin.exec_shell", &json!({ "command": "echo hello" }))
+            .await
+            .expect("shell execution should work");
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["stdout"].as_str().unwrap().contains("hello"));
+    }
+
     #[tokio::test]
     async fn workspace_traversal_rejected() {
         let (s, _d) = state().await;
@@ -1300,6 +1422,8 @@ mod tests {
 
     #[test]
     fn ssrf_protection() {
+        // The validator lives in web_research now; SSRF rules are covered there.
+        use crate::services::web_research::validate_public_url;
         assert!(validate_public_url("https://example.com").is_ok());
         assert!(validate_public_url("http://localhost/x").is_err());
         assert!(validate_public_url("http://127.0.0.1/x").is_err());

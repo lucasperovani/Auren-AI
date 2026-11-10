@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0",
+  "id": "web-research-skill",
+  "name": "Web Research",
+  "version": "1.0.0",
+  "description": "Search the web and read pages as clean text. No API key is required: search uses DuckDuckGo's public HTML endpoint. Retrieved content is treated as untrusted input.",
+  "implementation_type": "declarative",
+  "author": "Auren-AI",
+  "license": "GPL-3.0-or-later",
+  "required_integrations": [],
+  "required_permissions": [],
+  "tools": [
+    {
+      "tool_name": "web_search",
+      "description": "Search the web and return titles, URLs, and snippets. Use this first when you need current information you do not already have; then call web_fetch on the most promising result to read it.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to search for, as you would type it into a search engine"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many results to return (1-20, default 8)"
+          }
+        },
+        "required": ["query"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "web_search"
+    },
+    {
+      "tool_name": "web_fetch",
+      "description": "Open a public web page and return its readable text (scripts and markup removed) plus the page title. Use the URLs returned by web_search. Internal, loopback, and private addresses are refused, including via redirects.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Absolute http(s) URL of a public page"
+          }
+        },
+        "required": ["url"]
+      },
+      "risk_class": "low",
+      "implementation_type": "declarative",
+      "implementation_ref": "web_fetch"
+    },
+    {
+      "tool_name": "web_navigate",
+      "description": "Render a public page in a headless browser and return its text. Use this when web_fetch returns little or no content because the page builds itself with JavaScript (single-page apps, dashboards, infinite scroll). Slower than web_fetch, so try web_fetch first. Requires a browser to be installed on the server.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Absolute http(s) URL of a public page"
+          }
+        },
+        "required": ["url"]
+      },
+      "risk_class": "medium",
+      "implementation_type": "declarative",
+      "implementation_ref": "web_navigate"
+    }
+  ]
+}

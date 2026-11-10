@@ -1,0 +1,197 @@
+# GitHub Actions — desktop builds for Windows, Linux, and macOS.
+#
+# These are plain binaries (no container, no app-announcer): the announcer is
+# only used for the aarch64 image built by GitLab CI. Each matrix entry builds
+# on its own native runner, which avoids cross-compilation entirely.
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast on warnings in CI, matching the local workflow.
+  RUSTFLAGS: -D warnings
+  # sccache keeps compiled artifacts keyed by content, so unchanged crates are
+  # never rebuilt — including across the separate test and release jobs, which
+  # have different feature sets and targets.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # The registry cache avoids re-downloading the crates.io index, which is
+      # usually the slowest part of a cold run.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate caches per OS: artifact paths and dependency features
+          # differ, and sharing them would invalidate constantly.
+          key: test-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      # Tests use SQLite and tempdirs only; no service containers needed.
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  release:
+    name: build (${{ matrix.name }})
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner per OS, building every target that OS can produce.
+        # Windows and macOS cannot be cross-compiled from Linux (MSVC linker and
+        # Apple SDK respectively), but extra targets *within* an OS are cheap:
+        # the toolchain and caches are already warm in the same job.
+        include:
+          - name: linux
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+            archives: tar.gz
+          - name: windows
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            archives: zip
+          - name: macos
+            os: macos-latest
+            targets: x86_64-apple-darwin,aarch64-apple-darwin
+            archives: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Comma-separated list installs every target in one step.
+          targets: ${{ matrix.targets }}
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One cache per runner OS; the targets within a job share it.
+          key: release-${{ matrix.name }}
+          cache-on-failure: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      # musl needs a static-capable linker on the Linux runner.
+      - name: Install musl tools
+        if: matrix.name == 'linux'
+        uses: awalsh128/cache-apt-pkgs-action@v1.4.3
+        with:
+          packages: musl-tools
+          version: 1.0
+
+      # The release profile (LTO, opt-level=z, panic=abort, strip) comes from
+      # Cargo.toml, so the output is already the smallest codegen.
+      - name: Build every target for this OS
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in ${TARGETS//,/ }; do
+            echo "::group::build $target"
+            cargo build --release --workspace --target "$target"
+            echo "::endgroup::"
+          done
+        env:
+          TARGETS: ${{ matrix.targets }}
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      # The SPA is read from disk at runtime, so the frontend ships beside the
+      # binary. Keeping the layout identical across platforms makes the
+      # extraction instructions the same everywhere.
+      - name: Assemble packages (unix)
+        if: matrix.archives == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in ${TARGETS//,/ }; do
+            name="auren-ai-${GITHUB_REF_NAME:-dev}-${target}"
+            mkdir -p "dist/$name"
+            cp "target/$target/release/auren-server" "dist/$name/"
+            cp -r frontend "dist/$name/frontend"
+            cp -r skills "dist/$name/skills"
+            cp -r migrations "dist/$name/migrations"
+            cp README.md LICENSE "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          done
+        env:
+          TARGETS: ${{ matrix.targets }}
+
+      - name: Assemble packages (windows)
+        if: matrix.archives == 'zip'
+        shell: pwsh
+        run: |
+          foreach ($target in $env:TARGETS.Split(',')) {
+            $name = "auren-ai-$env:GITHUB_REF_NAME-$target"
+            New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+            Copy-Item "target/$target/release/auren-server.exe" "dist/$name/"
+            Copy-Item -Recurse frontend "dist/$name/frontend"
+            Copy-Item -Recurse skills "dist/$name/skills"
+            Copy-Item -Recurse migrations "dist/$name/migrations"
+            Copy-Item README.md, LICENSE "dist/$name/"
+            Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          }
+        env:
+          TARGETS: ${{ matrix.targets }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # One artifact per OS job; it holds every target built there.
+          name: auren-ai-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

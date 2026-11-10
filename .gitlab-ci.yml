@@ -1,0 +1,73 @@
+# GitLab CI — builds and publishes the aarch64 image with the app-announcer.
+#
+# Only aarch64 is produced here: the runtime base image
+# (registry.gitlab.com/lucas.perovani/app-announcer) is arm64, so the final
+# image must match. Desktop builds for other platforms live in GitHub Actions.
+#
+# Required CI/CD variables (Settings → CI/CD → Variables):
+#   CI_REGISTRY_*     provided automatically by GitLab
+#   The registry credentials are the job token; no extra secret is needed.
+stages:
+  - build
+
+variables:
+  # vfs avoids overlay-on-overlay failures inside container executors.
+  STORAGE_DRIVER: vfs
+  TARGET: aarch64-unknown-linux-musl
+  IMAGE_TAG: latest
+  # Buildah keeps its images and layer cache in $HOME by default. Pointing it
+  # at the project directory lets GitLab's cache preserve them between jobs.
+  BUILDAH_STORE: "$CI_PROJECT_DIR/.buildah"
+
+# Persist buildah's store between jobs. The key follows the two files that
+# actually change the dependency graph, so an unrelated commit reuses the cache
+# while a manifest change starts a fresh one.
+cache:
+  key:
+    files:
+      - Dockerfile
+      - Cargo.lock
+  paths:
+    - .buildah/
+
+build-arm64:
+  stage: build
+  image: quay.io/buildah/stable:latest
+  variables:
+    # buildah needs the fuse overlay driver to be usable by a non-root user;
+    # vfs plus --isolation=chroot keeps it working inside the runner container.
+    BUILDAH_ISOLATION: chroot
+  before_script:
+    - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    # Redirect the container store into the cached directory. Exported here
+    # rather than in `variables:` because it needs shell expansion.
+    - export STORAGE_OPTS="graphroot=$BUILDAH_STORE/storage runroot=$BUILDAH_STORE/runroot"
+    - if [ -d "$BUILDAH_STORE" ]; then du -sh "$BUILDAH_STORE"; else echo "cold cache: building from scratch"; fi
+  script:
+    # --arch aarch64 makes the final image arm64 even when the runner is amd64,
+    # and the musl target produces a static binary for that architecture.
+    #
+    # --layers caches each Dockerfile instruction. --cache-from reuses layers
+    # from the previously pushed image, which survives even when the local
+    # store was not restored; --cache-to publishes the new layers.
+    - >
+      buildah build
+      --arch aarch64
+      --layers
+      --cache-from "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+      --cache-to "$CI_REGISTRY_IMAGE:$IMAGE_TAG-cache"
+      --build-arg TARGET=$TARGET
+      -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+      -f Dockerfile .
+    - buildah push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+  after_script:
+    # Make the project public so the image can be pulled without credentials.
+    - >
+      curl --fail --silent --show-error --request PUT
+      --header "PRIVATE-TOKEN: ${CI_JOB_TOKEN}"
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}"
+      --data "visibility=public"
+      || echo "Note: could not change project visibility via the API"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'

@@ -571,6 +571,8 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "builtin.file_delete",
     "builtin.file_search",
     "builtin.web_fetch",
+    "builtin.web_search",
+    "builtin.web_navigate",
     "builtin.code_read_file",
     "builtin.code_write_file",
     "builtin.code_edit_block",

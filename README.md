@@ -40,7 +40,39 @@ Environment variables:
 | `AUREN_SESSION_SECRET` | Pepper for session token hashing | *(empty — set in production)* |
 | `AUREN_CREDENTIAL_ENCRYPTION_KEY` | Key for credential encryption at rest | derived from the session secret |
 | `AUREN_SKILLS_DIR` | Installed skill packages | `data/skills` |
+| `AUREN_BUILTIN_SKILLS_DIR` | Bundled skill packages offered for one-click install | `skills` (repo checkout) |
+| `AUREN_FRONTEND_DIR` | Directory serving the SPA | `frontend` |
+| `AUREN_BROWSER_PATH` | Chromium binary for `web_navigate` | auto-detected from `PATH` |
 | `AI_WORKSPACE_CONTAINER_PATH` | Agent workspace directory | `data/workspace` |
+
+### Binary size
+
+The release profile in `Cargo.toml` is tuned for the smallest artifact:
+`opt-level = "z"`, fat LTO, `codegen-units = 1`, `panic = "abort"`, and symbol
+stripping. A release build is ~6.6 MB (down from ~19 MB with default settings).
+
+`panic = "abort"` means a panicking request takes the process down instead of
+unwinding. This is safe here because every long-running path is supervised: the
+container's entrypoint restarts the server, and the SQLite state is committed
+before work is reported as done.
+
+### Docker image
+
+The image is Linux-only (aarch64 + app-announcer). Chromium, needed by
+`web_navigate`, is ~180 MB — more than the rest of the image combined — so it is
+opt-in:
+
+```bash
+# Default: small image, web_navigate reports "no browser installed"
+docker buildx build --platform linux/arm64 -t auren-ai:arm64 .
+
+# With JavaScript rendering enabled
+docker buildx build --platform linux/arm64 \
+  --build-arg WITH_BROWSER=true -t auren-ai:arm64 .
+```
+
+The binary is compressed with UPX in a separate stage, so the UPX toolchain
+never reaches the runtime image.
 | `AUREN_MAX_UPLOAD_BYTES` | Skill upload size limit | `52428800` (50 MB) |
 | `AUREN_MAX_WORKSPACE_FILE_BYTES` | Per-file workspace limit | `10485760` (10 MB) |
 

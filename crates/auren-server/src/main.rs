@@ -21,11 +21,15 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create directory {dir}"))?;
     }
-    if let Some(parent) = std::path::Path::new(&config.database_url)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
+    // Only a filesystem path needs its parent created. `database_url` is a
+    // SQLite URL such as `sqlite://data/auren.db?mode=rwc`, so treating it as
+    // a path created a literal `sqlite:` directory in the working directory.
+    if let Some(parent) = auren_server::config::sqlite_file_path(&config.database_url)
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
     {
-        let _ = std::fs::create_dir_all(parent);
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(&parent);
+        }
     }
     let pool = auren_server::db::connect(&config.database_url).await?;
     auren_server::db::migrate(&pool).await.context("database migrations failed")?;

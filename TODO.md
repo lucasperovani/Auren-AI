@@ -8,6 +8,11 @@
 - Ver se o instagram está integrado corretamente e funcionando e valide para ver se há limitação de uso da API (200 mensagens por hora, 50 a 100 posts por dia. Se estourar o limite, colocar nas notificações e tentar assim que o limite passar. Se possível, não faça pooling, se tiver que fazer, use backoff exponencial e não deixe a IA ficar fazendo o polling), marcar is_ai_generated ✅ (publish corrigido para `/media_publish`, container status, `is_ai_generated`, rate limits com deferral + backoff, sem polling da IA)
 - Precisa haver um esquema de notificação que a pessoa pode ver, ler, deletar notificações. A IA ou o sistema pode mandar essas notificações. Dependendo, pode passar para a IA agir sobre a notificação. A notificação precisa ter título, descrição e pode ter botões de ação ✅ (título, corpo, severidade, ações, badge de não lidas, ações despacham para o agente)
 
-- As tasks não podem mostrar o formato do tempo como no cron, precisa ser algo bonitinho
-- Corrigir/Remover testes flakiness
-- Melhorar e muito a interface
+- As tasks não podem mostrar o formato do tempo como no cron, precisa ser algo bonitinho ✅ (descriptions em linguagem natural + `relativeTime`)
+- Corrigir/Remover testes flakiness ✅ (race de inscrição no `EventBus` + ping inicial do WebSocket)
+- Melhorar e muito a interface ✅ (design system, kanban, notificações, login, ícones SVG, favicon)
+
+- Pesquisa web sem chave + leitura de páginas ✅ (`web-research-skill`: `web_search`, `web_fetch` com extração de texto, SSRF em redirects)
+- Navegação headless (Playwright/Chromium) ✅ (`web_navigate` via `chromium --headless --dump-dom`, sem daemon, Chromium instalado na imagem)
+- Pasta `sqlite:` criada indevidamente ✅ (`config::sqlite_file_path`)
+- Dockerfile aarch64 com app-announcer ✅ + `.gitlab-ci.yml` (só aarch64) + GitHub Actions (win/linux/mac, sem announcer) ✅

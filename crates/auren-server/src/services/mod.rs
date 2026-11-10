@@ -7,6 +7,7 @@
 pub mod approvals;
 pub mod audit;
 pub mod agent_runtime;
+pub mod browser;
 pub mod builtins;
 pub mod credentials;
 pub mod google_oauth;
@@ -24,7 +25,12 @@ pub mod task;
 pub mod task_collab;
 pub mod task_tools;
 pub mod tool_registry;
+pub mod web_research;
 pub mod worker;
 
+#[cfg(test)]
+mod browser_tests;
+#[cfg(test)]
+mod web_research_tests;
 #[cfg(test)]
 mod skill_installer_tests;

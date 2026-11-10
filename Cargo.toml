@@ -8,6 +8,23 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 rust-version = "1.85"
 
+# Release tuning aimed at the smallest possible shipped binary. The server is a
+# long-lived process, so slower codegen and LTO are paid once at build time.
+[profile.release]
+opt-level = "z"      # optimize for size over speed
+lto = "fat"          # whole-program optimization removes unreachable code
+codegen-units = 1    # one unit gives LTO the most to work with
+panic = "abort"      # no unwinding tables; the process cannot recover anyway
+strip = "symbols"    # no debug symbols in the artifact
+# Aborting on panic in a task is only safe because the server supervises
+# requests individually; a panicking handler takes the process down and the
+# supervisor restarts it, which is the documented container behavior.
+
+# Release builds for distribution can be tuned tighter still by enabling these
+# through the environment when building packages: see `.github/workflows`.
+[profile.release.package."*"]
+opt-level = "z"
+
 [workspace.dependencies]
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
@@ -33,6 +50,6 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 futures-util = "0.3"

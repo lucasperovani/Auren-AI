@@ -45,6 +45,7 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("gmail-skill", "Gmail: search, read, draft, and send email (send requires approval)"),
     ("gcal-skill", "Google Calendar: list, search, create, update, and cancel events"),
     ("gphotos-skill", "Google Photos: list albums and search media"),
+    ("web-research-skill", "Web Research: search the web and read pages as text (no API key required)"),
     ("instagram-skill", "Instagram: account info, media, and publishing (publish requires approval)"),
     ("flights-skill", "Flight monitoring and booking (purchase always requires approval)"),
     ("code-assistant-skill", "Code Assistant: read, create, and edit code in the workspace, Copilot-style"),
@@ -202,10 +203,9 @@ pub async fn install_builtin(
     if !BUILTIN_SKILLS.iter().any(|(id, _)| *id == skill_id) {
         return Err(ApiError::NotFound);
     }
-    // The packaged manifest is embedded at build time.
-    let manifest_bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills/gmail-skill/skill.json"));
-    let _ = manifest_bytes;
-    // Build the ZIP in memory from the packaged files.
+    // Build the ZIP in memory from the packaged files. The packages are read
+    // from the `skills/` directory at runtime rather than embedded, so the
+    // build does not depend on that directory being present.
     let bytes = builtin_package_zip(&skill_id)
         .ok_or_else(|| ApiError::NotFound)?;
     let svc = SkillInstallationService::new(&state);
@@ -219,8 +219,13 @@ pub async fn install_builtin(
 /// Build an in-memory ZIP of a built-in skill package.
 fn builtin_package_zip(skill_id: &str) -> Option<Vec<u8>> {
     use std::io::Write;
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills");
-    let dir = std::path::Path::new(base).join(skill_id);
+    // Built-in packages are read at runtime. `CARGO_MANIFEST_DIR` only works
+    // in a dev checkout: in a container the build tree is gone, so the
+    // directory must be overridable (the image ships it at /app/skills).
+    let base = std::env::var("AUREN_BUILTIN_SKILLS_DIR").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills").to_string()
+    });
+    let dir = std::path::Path::new(&base).join(skill_id);
     if !dir.is_dir() {
         return None;
     }

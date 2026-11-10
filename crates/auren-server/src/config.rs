@@ -71,3 +71,59 @@ impl AppConfig {
         })
     }
 }
+
+/// Extract the filesystem path of a SQLite database URL.
+///
+/// Accepts the forms SQLx supports — `sqlite:data/auren.db`, `sqlite://data/auren.db`,
+/// `sqlite:///data/auren.db` (absolute), and `sqlite::memory:` — and returns
+/// `None` for anything that has no file behind it (in-memory or a non-SQLite
+/// URL). Query parameters such as `?mode=rwc` are stripped, so callers never
+/// treat `sqlite://x` as a directory named `sqlite:`.
+pub fn sqlite_file_path(database_url: &str) -> Option<std::path::PathBuf> {
+    let rest = database_url.strip_prefix("sqlite:")?;
+    // In-memory databases have no path (and must not create one).
+    if rest.starts_with(":memory:") {
+        return None;
+    }
+    // Drop the query string (`?mode=rwc&cache=shared`).
+    let rest = rest.split('?').next().unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    // `sqlite:///abs/path` -> `/abs/path`; `sqlite://rel/path` -> `rel/path`.
+    let path = match rest.strip_prefix("//") {
+        Some(after) => after,
+        None => rest,
+    };
+    if path.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqlite_file_path;
+
+    #[test]
+    fn extracts_filesystem_path_from_sqlite_urls() {
+        // The bug: treating the URL as a path created a `sqlite:` directory.
+        assert_eq!(
+            sqlite_file_path("sqlite://data/auren.db?mode=rwc").as_deref(),
+            Some(std::path::Path::new("data/auren.db"))
+        );
+        assert_eq!(
+            sqlite_file_path("sqlite:data/auren.db").as_deref(),
+            Some(std::path::Path::new("data/auren.db"))
+        );
+        // Triple slash means an absolute path.
+        assert_eq!(
+            sqlite_file_path("sqlite:///data/auren.db?mode=rwc").as_deref(),
+            Some(std::path::Path::new("/data/auren.db"))
+        );
+        // In-memory and non-SQLite URLs have no file.
+        assert!(sqlite_file_path("sqlite::memory:").is_none());
+        assert!(sqlite_file_path("sqlite://").is_none());
+        assert!(sqlite_file_path("postgres://localhost/db").is_none());
+    }
+}
