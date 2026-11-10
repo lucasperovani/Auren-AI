@@ -648,11 +648,27 @@ pub async fn system_status(
         .fetch_one(&state.db)
         .await?
         .get("c");
+    // Report which host facilities are present. Tools that need a missing one
+    // are hidden from the agent, so this is the place the UI explains why a
+    // capability (browser, python, ssh, git) is unavailable.
+    let capabilities: Vec<serde_json::Value> = crate::services::capabilities::snapshot()
+        .iter()
+        .map(|(capability, ok)| {
+            json!({
+                "id": capability.id(),
+                "available": ok,
+                "install_hint": if *ok { serde_json::Value::Null } else { json!(capability.install_hint()) },
+            })
+        })
+        .collect();
+
     Ok(Json(json!({
         "status": if db_ok { "operational" } else { "degraded" },
         "database": db_ok,
         "pending_jobs": pending_jobs,
         "pending_approvals": pending_approvals,
         "user_id": user.id,
+        "capabilities": capabilities,
+        "missing_capabilities": crate::services::capabilities::missing(),
     })))
 }

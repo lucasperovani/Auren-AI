@@ -54,12 +54,58 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
 ];
 
 /// List the built-in skills available for one-click installation.
+///
+/// `available_tools` reports how many of a skill's tools can run on this host:
+/// a skill whose every tool needs a missing program (for example the browser)
+/// is still listed, but the UI can tell the user why it will not work.
 pub async fn builtin_catalog() -> ApiResult<Json<serde_json::Value>> {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills");
+    let skills_dir = std::env::var("AUREN_BUILTIN_SKILLS_DIR").unwrap_or_else(|_| base.to_string());
+
     let items: Vec<serde_json::Value> = BUILTIN_SKILLS
         .iter()
-        .map(|(id, description)| serde_json::json!({ "id": id, "description": description }))
+        .map(|(id, description)| {
+            let (total, usable) = count_usable_tools(&skills_dir, id);
+            serde_json::json!({
+                "id": id,
+                "description": description,
+                "tools_total": total,
+                "tools_available": usable,
+                // A skill with nothing runnable is offered but flagged.
+                "unavailable_tools": total.saturating_sub(usable),
+            })
+        })
         .collect();
     Ok(Json(serde_json::json!({ "items": items, "next_cursor": null })))
+}
+
+/// Count a built-in skill's tools and how many can run on this host.
+fn count_usable_tools(skills_dir: &str, skill_id: &str) -> (usize, usize) {
+    let manifest_path = std::path::Path::new(skills_dir).join(skill_id).join("skill.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return (0, 0);
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (0, 0);
+    };
+    let tools = manifest
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let total = tools.len();
+    let usable = tools
+        .iter()
+        .filter(|tool| {
+            let reference = tool
+                .get("implementation_ref")
+                .and_then(|r| r.as_str())
+                .or_else(|| tool.get("tool_name").and_then(|n| n.as_str()))
+                .unwrap_or_default();
+            crate::services::capabilities::tool_is_available(reference)
+        })
+        .count();
+    (total, usable)
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +695,15 @@ pub async fn list_tools(
     let items: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
+            let reference: String = r
+                .try_get::<Option<String>, _>("implementation_ref")
+                .ok()
+                .flatten()
+                .or_else(|| r.try_get::<String, _>("tool_name").ok())
+                .unwrap_or_default();
+            // `available: false` means the tool is installed but cannot run on
+            // this host (missing program). The UI shows it greyed out with the
+            // reason instead of letting the agent call something broken.
             json!({
                 "id": r.get::<String, _>("id"),
                 "tool_name": r.get::<String, _>("tool_name"),
@@ -656,6 +711,8 @@ pub async fn list_tools(
                 "input_schema": serde_json::from_str::<serde_json::Value>(&r.get::<String, _>("input_schema_json")).unwrap_or(json!({})),
                 "risk_class": r.get::<String, _>("risk_class"),
                 "implementation_type": r.get::<String, _>("implementation_type"),
+                "available": crate::services::capabilities::tool_is_available(&reference),
+                "unavailable_reason": crate::services::capabilities::unavailable_reason(&reference),
             })
         })
         .collect();

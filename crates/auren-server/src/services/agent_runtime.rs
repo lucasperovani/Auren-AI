@@ -285,7 +285,8 @@ impl AgentRuntime {
         }
 
         let rows = sqlx::query(
-            "SELECT st.tool_name, st.description, st.input_schema_json
+            "SELECT st.tool_name, st.description, st.input_schema_json,
+                    COALESCE(st.implementation_ref, st.tool_name) AS impl_ref
              FROM skill_tools st
              JOIN skill_versions sv ON sv.id = st.skill_version_id
              JOIN skills sk ON sk.id = sv.skill_id
@@ -300,14 +301,26 @@ impl AgentRuntime {
         .fetch_all(&self.state.db)
         .await
         .unwrap_or_default();
-        let mut tools: Vec<LlmToolDefinition> = rows
-            .iter()
-            .map(|r| LlmToolDefinition {
+        let mut tools: Vec<LlmToolDefinition> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let impl_ref: String = r.try_get("impl_ref").unwrap_or_default();
+            // Never advertise a tool whose runtime requirement is missing on
+            // this host: the model would call it and the user would see an
+            // unexplained failure. `tools_unavailable` is surfaced to the UI.
+            if !crate::services::capabilities::tool_is_available(&impl_ref) {
+                tracing::debug!(
+                    tool = %r.get::<String, _>("tool_name"),
+                    impl_ref = %impl_ref,
+                    "hiding tool: host capability unavailable"
+                );
+                continue;
+            }
+            tools.push(LlmToolDefinition {
                 name: r.get("tool_name"),
                 description: r.get("description"),
                 input_schema: serde_json::from_str(&r.get::<String, _>("input_schema_json")).unwrap_or(json!({})),
-            })
-            .collect();
+            });
+        }
 
         // MCP tools are discovered from the servers themselves, so their
         // catalogue is refreshed on every turn (see below) rather than read
@@ -412,7 +425,8 @@ impl AgentRuntime {
         }
         // Same rule as `available_tools`: only the active version counts.
         let row = sqlx::query(
-            "SELECT st.id FROM skill_tools st
+            "SELECT st.id, COALESCE(st.implementation_ref, st.tool_name) AS impl_ref
+             FROM skill_tools st
              JOIN agent_skills ask ON ask.skill_version_id = st.skill_version_id
              JOIN skill_versions sv ON sv.id = st.skill_version_id
              JOIN skills sk ON sk.id = sv.skill_id
@@ -425,6 +439,16 @@ impl AgentRuntime {
         .await
         .ok()
         .flatten()?;
+
+        // Hidden tools are not advertised, but a model can still emit a call
+        // for one it remembers. Refusing here with the reason is far better
+        // than letting the invocation fail deep inside the implementation.
+        let impl_ref: String = row.try_get("impl_ref").unwrap_or_default();
+        if let Some(reason) = crate::services::capabilities::unavailable_reason(&impl_ref) {
+            tracing::warn!(tool = %tool_name, %reason, "refused call to unavailable tool");
+            return None;
+        }
+
         row.try_get("id").ok()
     }
 

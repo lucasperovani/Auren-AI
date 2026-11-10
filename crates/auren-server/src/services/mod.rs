@@ -9,6 +9,7 @@ pub mod audit;
 pub mod agent_runtime;
 pub mod browser;
 pub mod builtins;
+pub mod capabilities;
 pub mod credentials;
 pub mod google_oauth;
 pub mod github_oauth;

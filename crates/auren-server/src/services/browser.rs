@@ -34,14 +34,21 @@ const MAX_DOM_CHARS: usize = 500_000;
 
 /// Locate a Chromium-compatible binary.
 ///
-/// `AUREN_BROWSER_PATH` wins so operators can point at any build; otherwise the
-/// usual names are probed in `PATH`.
+/// `AUREN_BROWSER_PATH` is authoritative: when it is set, that exact binary is
+/// used and a missing file means "no browser". Silently falling back to a
+/// different browser would ignore explicit configuration — an operator who
+/// pinned a path needs to know it is wrong, and the capability check that
+/// hides `web_navigate` depends on that answer being predictable.
+///
+/// When the variable is unset, the usual names are probed in `PATH`.
 pub fn find_browser() -> Option<std::path::PathBuf> {
     if let Ok(explicit) = std::env::var("AUREN_BROWSER_PATH") {
-        let path = std::path::PathBuf::from(explicit);
-        if path.is_file() {
-            return Some(path);
+        let trimmed = explicit.trim();
+        if trimmed.is_empty() {
+            return None;
         }
+        let path = std::path::PathBuf::from(trimmed);
+        return if path.is_file() { Some(path) } else { None };
     }
     const CANDIDATES: [&str; 8] = [
         "chromium",

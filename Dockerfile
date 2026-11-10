@@ -81,12 +81,16 @@ ARG TARGET=aarch64-unknown-linux-musl
 ARG WITH_BROWSER=false
 
 # Chromium is ~180 MB, more than everything else combined. It is installed only
-# on request so the default image stays small; `web_navigate` reports a clear
-# error when it is missing.
+# on request so the default image stays small.
+#
+# When it is absent the server detects that at startup and *hides* the tools
+# that need it: the agent is never offered `web_navigate`, so a user cannot hit
+# a silent failure. No environment variable is needed either way: the server
+# probes PATH, and Alpine installs `/usr/bin/chromium-browser`.
 RUN if [ "$WITH_BROWSER" = "true" ]; then \
         apk add --no-cache chromium ca-certificates; \
     else \
-        echo "Chromium skipped (WITH_BROWSER=false); web_navigate will be unavailable"; \
+        echo "Chromium skipped (WITH_BROWSER=false); web_navigate will not be offered"; \
     fi
 
 COPY --from=compress /auren-server /app/auren-server
@@ -107,8 +111,7 @@ ENV APP_INSTANCE_NAME=auren \
     AUREN_BUILTIN_SKILLS_DIR=/app/skills \
     AUREN_SKILLS_DIR=/data/skills \
     AUREN_WORKSPACE_DIR=/workspace \
-    AI_WORKSPACE_CONTAINER_PATH=/workspace \
-    AUREN_BROWSER_PATH=/usr/bin/chromium-browser
+    AI_WORKSPACE_CONTAINER_PATH=/workspace
 
 RUN mkdir -p /data/skills /workspace
 

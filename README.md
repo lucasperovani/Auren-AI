@@ -73,6 +73,29 @@ docker buildx build --platform linux/arm64 \
 
 The binary is compressed with UPX in a separate stage, so the UPX toolchain
 never reaches the runtime image.
+
+### Host capabilities
+
+Some tools need a program that may be missing on the deployment host. Rather
+than advertising them and failing when called, the server probes the host once
+at startup and **hides the tools it cannot run**, so the agent is never offered
+something broken.
+
+| Capability | Needed by | Detected via |
+|---|---|---|
+| `browser` | `web_navigate` | `AUREN_BROWSER_PATH`, then `PATH` |
+| `shell` | `exec_shell` | `sh` (or `cmd` on Windows) |
+| `python` | `exec_python` | `python3` / `python` / `py` |
+| `ssh` | `exec_ssh`, `ssh_connect` | `ssh` |
+| `git` | `git_*` tools | `git` |
+
+`GET /api/v1/system/status` reports each capability with an install hint, and
+`GET /api/v1/skills/{id}/tools` flags individual tools with `available` and
+`unavailable_reason`. `web_search` and `web_fetch` never need a browser, so
+web research keeps working in the default image.
+
+`AUREN_BROWSER_PATH` is authoritative: setting it to a path that does not exist
+disables the browser instead of silently falling back to another one.
 | `AUREN_MAX_UPLOAD_BYTES` | Skill upload size limit | `52428800` (50 MB) |
 | `AUREN_MAX_WORKSPACE_FILE_BYTES` | Per-file workspace limit | `10485760` (10 MB) |
 
