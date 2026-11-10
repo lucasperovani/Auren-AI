@@ -52,26 +52,21 @@ build-arm64:
     # and the musl target produces a static binary for that architecture.
     #
     # --layers caches each Dockerfile instruction. --cache-from reuses layers
-    # from the previously pushed image, which survives even when the local
-    # store was not restored; --cache-to publishes the new layers.
+    # from the previously pushed image, so only changed stages rebuild.
+    #
+    # NOTE: --cache-to must NOT include a tag — buildah rejects it with
+    # "repository must contain neither a tag nor digest". The cache is keyed by
+    # content, not by reference, so the bare repository path is enough.
     - >
       buildah build
       --arch aarch64
       --layers
       --cache-from "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
-      --cache-to "$CI_REGISTRY_IMAGE:$IMAGE_TAG-cache"
+      --cache-to "$CI_REGISTRY_IMAGE"
       --build-arg TARGET=$TARGET
       -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
       -f Dockerfile .
     - buildah push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
-  after_script:
-    # Make the project public so the image can be pulled without credentials.
-    - >
-      curl --fail --silent --show-error --request PUT
-      --header "PRIVATE-TOKEN: ${CI_JOB_TOKEN}"
-      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}"
-      --data "visibility=public"
-      || echo "Note: could not change project visibility via the API"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'

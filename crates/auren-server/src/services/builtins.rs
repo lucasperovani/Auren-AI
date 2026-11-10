@@ -340,7 +340,13 @@ fn list_tree(dir: &std::path::Path, root: &std::path::Path, items: &mut Vec<Valu
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+            // Paths are reported with forward slashes on every platform. A
+            // Windows `strip_prefix` yields `a\b.py`, which would not match the
+            // workspace-relative paths the API documents (and that the agent
+            // passes back in later calls).
+            let relative = to_unix_separators(
+                path.strip_prefix(root).unwrap_or(&path).to_string_lossy().as_ref(),
+            );
             if path.is_dir() {
                 items.push(json!({ "path": relative, "type": "directory" }));
                 list_tree(&path, root, items, depth + 1, max_depth);
@@ -353,6 +359,12 @@ fn list_tree(dir: &std::path::Path, root: &std::path::Path, items: &mut Vec<Valu
             }
         }
     }
+}
+
+/// Convert a native path string to forward slashes, so responses are
+/// identical regardless of the host operating system.
+fn to_unix_separators(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 /// Search code with a text query across the workspace.
@@ -377,7 +389,9 @@ fn search_code_recursive(dir: &std::path::Path, query: &str, matches: &mut Vec<V
                 for (i, line) in content.lines().enumerate() {
                     if line.contains(query) {
                         matches.push(json!({
-                            "path": path.to_string_lossy(),
+                            // Forward slashes on every platform: the agent
+                            // feeds this path back into other tools.
+                            "path": to_unix_separators(&path.to_string_lossy()),
                             "line": i + 1,
                             "text": line.trim().chars().take(200).collect::<String>(),
                         }));
@@ -1089,12 +1103,29 @@ async fn run_git(
         return Err(ApiError::NotFound);
     }
 
+    // Identity from the environment, otherwise a stable default. `git commit`
+    // refuses to run without one and exits 128.
+    let author = std::env::var("GIT_AUTHOR_NAME")
+        .or_else(|_| std::env::var("GIT_COMMITTER_NAME"))
+        .unwrap_or_else(|_| "Auren-AI".to_string());
+    let author_email = std::env::var("GIT_AUTHOR_EMAIL")
+        .or_else(|_| std::env::var("GIT_COMMITTER_EMAIL"))
+        .unwrap_or_else(|_| "auren-ai@localhost".to_string());
+
     let mut command = tokio::process::Command::new("git");
     command
         .args(args)
         .current_dir(&dir)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never");
+        .env("GCM_INTERACTIVE", "never")
+        // Fallback identity only. CI runners and fresh containers have no git
+        // identity, so `git commit` fails with exit 128 ("Author identity
+        // unknown"). These variables are passed through when the operator
+        // configured them, and a default is supplied otherwise.
+        .env("GIT_AUTHOR_NAME", &author)
+        .env("GIT_AUTHOR_EMAIL", &author_email)
+        .env("GIT_COMMITTER_NAME", &author)
+        .env("GIT_COMMITTER_EMAIL", &author_email);
     if let Some(token) = token {
         // git reads credentials from these variables for http(s) remotes;
         // they are not inherited by child processes of git itself.
@@ -1480,6 +1511,32 @@ mod tests {
         assert!(tree["items"].as_array().unwrap().iter().any(|i| i["path"] == "a/b.py"));
         let search = execute_builtin(&s, "builtin.code_search", &json!({ "query": "42" })).await.unwrap();
         assert_eq!(search["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn paths_are_reported_with_forward_slashes() {
+        // Windows joins paths with `\`. Responses must be identical on every
+        // platform because the agent feeds these paths back into other tools —
+        // `a\b.py` would not resolve.
+        assert_eq!(to_unix_separators(r"a\b.py"), "a/b.py");
+        assert_eq!(to_unix_separators("a/b.py"), "a/b.py");
+        assert_eq!(to_unix_separators(r"src\nested\deep\file.rs"), "src/nested/deep/file.rs");
+        assert_eq!(to_unix_separators(""), "");
+    }
+
+    #[test]
+    fn git_fallback_identity_is_stable() {
+        // `git commit` exits 128 without an identity, which is the state of a
+        // fresh CI runner or container. The fallback must be non-empty and
+        // look like an email so git accepts it.
+        let author = std::env::var("GIT_AUTHOR_NAME")
+            .or_else(|_| std::env::var("GIT_COMMITTER_NAME"))
+            .unwrap_or_else(|_| "Auren-AI".to_string());
+        let email = std::env::var("GIT_AUTHOR_EMAIL")
+            .or_else(|_| std::env::var("GIT_COMMITTER_EMAIL"))
+            .unwrap_or_else(|_| "auren-ai@localhost".to_string());
+        assert!(!author.trim().is_empty());
+        assert!(email.contains('@'), "git requires an email-shaped identity");
     }
 
     #[test]
