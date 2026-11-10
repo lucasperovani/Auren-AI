@@ -180,6 +180,17 @@ pub async fn complete_job(db: &SqlitePool, job_id: &str, run_id: &str, result_js
     .bind(run_id)
     .execute(&mut *tx)
     .await?;
+    // A finished run moves its task to Done on the board. The execution
+    // status is untouched, so a scheduled task keeps its next fire time.
+    sqlx::query(
+        "UPDATE tasks SET stage = 'done', updated_at = ?
+         WHERE id = (SELECT task_id FROM task_runs WHERE id = ?)
+           AND stage != 'done'",
+    )
+    .bind(&now)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }

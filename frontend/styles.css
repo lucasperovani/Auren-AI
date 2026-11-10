@@ -522,24 +522,6 @@ body.sidebar-collapsed .content { margin-left: 0; }
   color: var(--text); font-weight: 600;
 }
 
-.task-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 16px;
-}
-
-.task-card {
-  display: flex; flex-direction: column; gap: 12px;
-  padding: 18px; background: var(--surface);
-  border: 1px solid var(--border); border-radius: var(--radius);
-  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
-}
-.task-card:hover {
-  border-color: var(--border-strong); box-shadow: var(--shadow); transform: translateY(-1px);
-}
-
-.task-card-head { display: flex; align-items: flex-start; gap: 10px; }
-
 .task-title {
   font-size: 0.98rem; font-weight: 650; letter-spacing: -0.01em;
   line-height: 1.35; word-break: break-word;
@@ -657,6 +639,137 @@ body.sidebar-collapsed .content { margin-left: 0; }
   margin-top: 12px; padding-top: 10px;
   border-top: 1px solid var(--border);
   font-size: 0.79rem; line-height: 1.6;
+}
+
+/* -----------------------------------------------------------------------
+   Kanban board
+   ----------------------------------------------------------------------- */
+
+.kanban {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(260px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+/* Collapsed columns shrink instead of wrapping the board. */
+.kanban:has(.kanban-col.is-collapsed) {
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+}
+
+.kanban-col {
+  display: flex; flex-direction: column; gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  border-top: 3px solid var(--border-strong);
+}
+
+.kanban-col.col-analysis { border-top-color: var(--muted); }
+.kanban-col.col-todo { border-top-color: var(--accent); }
+.kanban-col.col-progress { border-top-color: var(--warning); }
+.kanban-col.col-done { border-top-color: var(--success); }
+
+.kanban-col.is-collapsed { align-items: center; padding: 14px 8px; }
+.kanban-col.is-collapsed .kanban-col-head { flex-direction: column; gap: 8px; }
+.kanban-col.is-collapsed h3 { writing-mode: vertical-rl; font-size: 0.8rem; }
+
+.kanban-col-head {
+  display: flex; align-items: center; gap: 8px;
+}
+
+.kanban-col-head h3 {
+  font-size: 0.85rem; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+.kanban-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--border-strong); flex-shrink: 0;
+}
+.col-analysis .kanban-dot { background: var(--muted); }
+.col-todo .kanban-dot { background: var(--accent); }
+.col-progress .kanban-dot { background: var(--warning); }
+.col-done .kanban-dot { background: var(--success); }
+
+.kanban-count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 19px; padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-3); color: var(--text-soft);
+  font-size: 0.72rem; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.kanban-col-hint { font-size: 0.75rem; margin-top: -4px; }
+
+.kanban-drop {
+  display: flex; flex-direction: column; gap: 10px;
+  min-height: 90px;
+  border: 2px dashed transparent;
+  border-radius: var(--radius);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+/* Drop target feedback while a card is dragged over the column. */
+.kanban-drop.is-over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.kanban-empty {
+  padding: 24px 12px; text-align: center;
+  font-size: 0.82rem; color: var(--muted);
+  border: 1px dashed var(--border); border-radius: var(--radius);
+}
+
+.kanban-card {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: grab;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease, opacity 0.15s ease;
+}
+
+.kanban-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow);
+}
+
+.kanban-card:active { cursor: grabbing; }
+
+.kanban-card.is-dragging {
+  opacity: 0.45;
+  transform: scale(0.99);
+}
+
+/* Finished work is visually quieter so open work stands out. */
+.kanban-card.is-done { opacity: 0.72; }
+.kanban-card.is-done:hover { opacity: 1; }
+.kanban-card.is-done .task-title { text-decoration: line-through; text-decoration-color: var(--border-strong); }
+
+.kanban-card-head {
+  display: flex; align-items: flex-start; gap: 8px;
+}
+
+.kanban-add {
+  padding: 8px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.kanban-add:hover {
+  color: var(--text); border-color: var(--border-strong); background: var(--surface-2);
 }
 
 /* Tables */
@@ -904,6 +1017,10 @@ body.sidebar-collapsed .content { margin-left: 0; }
 /* ---------------------------------------------------------------------------
    Responsive
    --------------------------------------------------------------------------- */
+@media (max-width: 1100px) {
+  .kanban { grid-template-columns: repeat(2, minmax(240px, 1fr)); }
+}
+
 @media (max-width: 900px) {
   .content { padding: 24px 20px 64px; }
   .chat-layout { height: auto; flex-direction: column; }
@@ -929,6 +1046,14 @@ body.sidebar-collapsed .content { margin-left: 0; }
   .kv dt { margin-top: 8px; }
   .chat-bubble, .tool-trace { max-width: 92%; }
   .toast { left: 16px; right: 16px; bottom: 16px; max-width: none; }
+  /* One column per screen keeps cards readable; the board scrolls. */
+  .kanban {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  .kanban-col.is-collapsed { align-items: stretch; padding: 14px; }
+  .kanban-col.is-collapsed .kanban-col-head { flex-direction: row; gap: 8px; }
+  .kanban-col.is-collapsed h3 { writing-mode: horizontal-tb; font-size: 0.85rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {

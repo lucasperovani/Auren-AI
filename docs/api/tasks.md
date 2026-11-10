@@ -17,6 +17,7 @@ Tasks are persistent, schedulable units of work. A task run is one execution of 
 | POST | `/api/v1/tasks/{task_id}/pause` | Pause future executions |
 | POST | `/api/v1/tasks/{task_id}/resume` | Resume future executions |
 | POST | `/api/v1/tasks/{task_id}/cancel` | Cancel active work where possible |
+| POST | `/api/v1/tasks/{task_id}/stage` | Move a task to another board column |
 | GET | `/api/v1/tasks/{task_id}/runs` | List execution history |
 | GET | `/api/v1/tasks/{task_id}/schedule` | Retrieve scheduling information |
 | PUT | `/api/v1/tasks/{task_id}/schedule` | Update scheduling information |
@@ -36,10 +37,37 @@ as the user-facing label:
 | `next_run_at` | Next fire time (RFC 3339) while the schedule is active |
 | `last_run_status` | Status of the most recent run, or `null` |
 | `last_run_at` | Creation time of the most recent run, or `null` |
+| `stage` | Kanban column: `analysis`, `todo`, `in_progress`, or `done` |
 
 `PATCH /tasks/{id}` treats `schedule` as follows: omitted leaves the schedule
 unchanged, `null` removes the schedule and returns the task to on-demand
 (`draft`), and an object replaces it and reactivates the task.
+
+### Kanban stage
+
+`stage` is the board position and is **independent of `status`**: `status` is
+the execution state owned by the scheduler (it decides whether a schedule
+fires), while `stage` only tracks where a card sits.
+
+| Stage | Meaning |
+|---|---|
+| `analysis` | Still needs scope or requirements |
+| `todo` | Ready to run |
+| `in_progress` | Actively being worked |
+| `done` | Closed |
+
+Movement:
+
+- `POST /tasks/{task_id}/stage` with `{ "stage": "in_progress" }` moves a card.
+  `PATCH /tasks/{task_id}` also accepts `stage`.
+- New tasks start in `todo` when created with a schedule and in `analysis`
+  otherwise. Removing a schedule returns the task to `analysis`.
+- A run starting moves the card to `in_progress`; a run completing moves it to
+  `done`. Cancelling or completing a task also closes the card.
+- Dragging never changes `status`: a scheduled task keeps firing wherever it
+  sits, so moving a card cannot silently pause work.
+- Unknown stages return `422`; reopening a closed task (`completed`/`cancelled`)
+  returns `409`.
 
 ## Task runs
 

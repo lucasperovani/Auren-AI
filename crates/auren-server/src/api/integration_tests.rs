@@ -776,3 +776,153 @@ async fn task_schedule_can_be_removed_or_left_untouched() {
     assert!(body["next_run_at"].is_null());
     assert_eq!(body["status"], "draft");
 }
+
+/// Tasks land in the right board column on creation, and moving a card never
+/// changes the execution status that drives the scheduler.
+#[tokio::test]
+async fn kanban_stage_is_independent_from_execution_status() {
+    let (app, state, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+
+    // A scheduled task is ready to run, so it starts in To Do.
+    let (status, scheduled) = post_json(
+        &app,
+        "/api/v1/tasks",
+        Some(&token),
+        json!({ "agent_id": agent_id, "title": "Scheduled", "objective": "O", "schedule": { "cron": "0 9 * * *" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(scheduled["stage"], "todo");
+    let scheduled_id = scheduled["id"].as_str().unwrap().to_string();
+
+    // An on-demand task still needs scope, so it starts in Analysis.
+    let (_, manual) = post_json(
+        &app,
+        "/api/v1/tasks",
+        Some(&token),
+        json!({ "agent_id": agent_id, "title": "Manual", "objective": "O" }),
+    )
+    .await;
+    assert_eq!(manual["stage"], "analysis");
+
+    // Moving to another column changes only the stage.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/tasks/{scheduled_id}/stage"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "stage": "in_progress" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, moved) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(moved["stage"], "in_progress");
+    // The schedule is untouched: the task still fires.
+    assert_eq!(moved["status"], "active");
+    assert_eq!(moved["schedule_cron"], "0 9 * * *");
+    let next: String = sqlx::query("SELECT next_run_at FROM scheduled_jobs WHERE task_id = ?")
+        .bind(&scheduled_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .get("next_run_at");
+    assert!(!next.is_empty());
+
+    // An unknown column is rejected instead of being stored blindly.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/tasks/{scheduled_id}/stage"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "stage": "wishlist" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Dragging is also possible through the regular PATCH.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/tasks/{scheduled_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "stage": "todo" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["stage"], "todo");
+    assert_eq!(body["status"], "active");
+}
+
+/// The board advances automatically: a started run moves the card to In
+/// Progress and a finished one moves it to Done, without touching `status`.
+#[tokio::test]
+async fn kanban_advances_with_run_lifecycle() {
+    let (app, state, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let (_, task) = post_json(
+        &app,
+        "/api/v1/tasks",
+        Some(&token),
+        json!({ "agent_id": agent_id, "title": "T", "objective": "O" }),
+    )
+    .await;
+    let task_id = task["id"].as_str().unwrap().to_string();
+    assert_eq!(task["stage"], "analysis");
+
+    // Queue and execute one run. No LLM provider is configured, so the run
+    // ends failed — the stage must still reflect the lifecycle.
+    let (_, run) = post_json(&app, &format!("/api/v1/tasks/{task_id}/run"), Some(&token), json!({})).await;
+    let run_id = run["task_run_id"].as_str().unwrap().to_string();
+    crate::services::worker::tick_once(&state, "test-worker").await.unwrap();
+
+    let stage: String = sqlx::query("SELECT stage FROM tasks WHERE id = ?")
+        .bind(&task_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .get("stage");
+    assert_eq!(stage, "in_progress", "a started run moves the card forward");
+
+    // A completed run closes the card.
+    sqlx::query("UPDATE queued_jobs SET status = 'done' WHERE task_run_id = ?")
+        .bind(&run_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    crate::services::scheduler::complete_job(&state.db, "unused-job", &run_id, "{}")
+        .await
+        .unwrap();
+    let stage: String = sqlx::query("SELECT stage FROM tasks WHERE id = ?")
+        .bind(&task_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .get("stage");
+    assert_eq!(stage, "done", "a completed run closes the card");
+    // Execution status is untouched by the board transition.
+    let status: String = sqlx::query("SELECT status FROM tasks WHERE id = ?")
+        .bind(&task_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .get("status");
+    assert_eq!(status, "draft");
+}

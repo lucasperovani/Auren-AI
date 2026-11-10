@@ -7,6 +7,10 @@ use sqlx::{Row, SqlitePool};
 
 use crate::{error::ApiError, events::EventEnvelope, state::AppState};
 
+/// Board columns, in display order. The stage is a workflow position and is
+/// deliberately independent of the execution status.
+pub const STAGES: [&str; 4] = ["analysis", "todo", "in_progress", "done"];
+
 pub struct TaskService {
     db: SqlitePool,
     events: crate::events::SharedEventBus,
@@ -71,11 +75,14 @@ impl TaskService {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         let status = if schedule.is_some() { "active" } else { "draft" };
+        // A task with a schedule is ready to run, so it starts in To Do. One
+        // without a schedule still needs scope, so it starts in Analysis.
+        let stage = if schedule.is_some() { "todo" } else { "analysis" };
 
         let mut tx = self.db.begin().await.map_err(ApiError::from)?;
         sqlx::query(
-            "INSERT INTO tasks (id, user_id, agent_id, conversation_id, title, objective, status, schedule_json, timezone, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, user_id, agent_id, conversation_id, title, objective, status, stage, schedule_json, timezone, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(user_id)
@@ -84,6 +91,7 @@ impl TaskService {
         .bind(title.trim())
         .bind(objective.trim())
         .bind(status)
+        .bind(stage)
         .bind(schedule.map(|s| s.to_string()))
         .bind(timezone)
         .bind(&now)
@@ -135,6 +143,42 @@ impl TaskService {
         .execute(&mut **tx)
         .await
         .map_err(ApiError::from)?;
+        Ok(())
+    }
+
+    /// Move a task to another board column.
+    ///
+    /// The stage is a workflow position, independent of the execution status:
+    /// a scheduled task dragged to Done keeps firing unless the user pauses
+    /// it, and a task dragged to In Progress is not started automatically.
+    pub async fn set_stage(&self, user_id: &str, task_id: &str, stage: &str) -> Result<(), ApiError> {
+        if !STAGES.contains(&stage) {
+            return Err(ApiError::Unprocessable(format!(
+                "unknown stage '{stage}'; expected one of {}",
+                STAGES.join(", ")
+            )));
+        }
+        let status = self.require_owned(user_id, task_id).await?;
+
+        // Closed work stays closed: moving a cancelled task back into the
+        // pipeline would contradict its terminal state.
+        if stage != "done" && matches!(status.as_str(), "completed" | "cancelled") {
+            return Err(ApiError::Conflict(
+                "task is closed; create a new task instead of reopening it".into(),
+            ));
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("UPDATE tasks SET stage = ?, updated_at = ? WHERE id = ?")
+            .bind(stage)
+            .bind(&now)
+            .bind(task_id)
+            .execute(&self.db)
+            .await?;
+        self.events.publish(EventEnvelope::new(
+            "task.stage_changed",
+            json!({ "task_id": task_id, "stage": stage }),
+        ));
         Ok(())
     }
 
@@ -205,8 +249,9 @@ impl TaskService {
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
-        // A task without a schedule is on-demand, never `active`.
-        sqlx::query("UPDATE tasks SET schedule_json = NULL, status = 'draft', updated_at = ? WHERE id = ?")
+        // A task without a schedule is on-demand, never `active`, and returns
+        // to Analysis because it needs scope work before it can run again.
+        sqlx::query("UPDATE tasks SET schedule_json = NULL, status = 'draft', stage = 'analysis', updated_at = ? WHERE id = ?")
             .bind(&now)
             .bind(task_id)
             .execute(&mut *tx)
@@ -247,6 +292,15 @@ impl TaskService {
         }
         if status == "active" {
             sqlx::query("UPDATE scheduled_jobs SET status = 'active', updated_at = ? WHERE task_id = ?")
+                .bind(&now)
+                .bind(task_id)
+                .execute(&self.db)
+                .await?;
+        }
+        // Cancelling closes the card on the board; pausing keeps it where it
+        // is so resuming does not lose its position.
+        if status == "cancelled" || status == "completed" {
+            sqlx::query("UPDATE tasks SET stage = 'done', updated_at = ? WHERE id = ?")
                 .bind(&now)
                 .bind(task_id)
                 .execute(&self.db)

@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/{task_id}/pause", post(pause_task))
         .route("/{task_id}/resume", post(resume_task))
         .route("/{task_id}/cancel", post(cancel_task))
+        .route("/{task_id}/stage", post(move_task_stage))
         .route("/{task_id}/runs", get(list_runs))
         .route("/{task_id}/schedule", get(get_schedule).put(put_schedule))
         .route("/{task_id}/steps", get(get_steps))
@@ -46,6 +47,8 @@ pub struct TaskResponse {
     pub title: String,
     pub objective: String,
     pub status: String,
+    /// Kanban column: `analysis`, `todo`, `in_progress`, or `done`.
+    pub stage: String,
     pub schedule: Option<serde_json::Value>,
     /// Raw cron expression when the task is scheduled. Clients render a
     /// human description; the expression itself is never shown to users.
@@ -86,6 +89,7 @@ fn row_to_task(r: &sqlx::sqlite::SqliteRow) -> TaskResponse {
         title: r.get("title"),
         objective: r.get("objective"),
         status: r.get("status"),
+        stage: r.try_get("stage").unwrap_or_else(|_| "todo".to_string()),
         schedule,
         schedule_cron,
         next_run_at: r.try_get("next_run_at").ok().flatten(),
@@ -192,6 +196,9 @@ pub async fn get_task(
 pub struct UpdateTaskRequest {
     pub title: Option<String>,
     pub objective: Option<String>,
+    /// Kanban column. Sent by the board when a card is dragged.
+    #[serde(default)]
+    pub stage: Option<String>,
     /// `None` = field absent (leave unchanged); `Some(None)` = explicit null
     /// (remove the schedule); `Some(Some(v))` = replace the schedule.
     #[serde(default, deserialize_with = "double_option")]
@@ -229,6 +236,32 @@ pub async fn update_task(
                 .await?;
         }
     }
+    if let Some(stage) = req.stage.as_deref() {
+        svc.set_stage(&user.id, &task_id, stage).await?;
+    }
+    let row = sqlx::query(&format!("{TASK_SELECT} WHERE t.id = ?"))
+        .bind(&task_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(row_to_task(&row)))
+}
+
+#[derive(Deserialize)]
+pub struct MoveStageRequest {
+    pub stage: String,
+}
+
+/// Move a task to another board column. This never changes the execution
+/// status, so dragging a card cannot silently pause a schedule.
+pub async fn move_task_stage(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(task_id): Path<String>,
+    Json(req): Json<MoveStageRequest>,
+) -> ApiResult<Json<TaskResponse>> {
+    TaskService::new(&state)
+        .set_stage(&user.id, &task_id, &req.stage)
+        .await?;
     let row = sqlx::query(&format!("{TASK_SELECT} WHERE t.id = ?"))
         .bind(&task_id)
         .fetch_one(&state.db)

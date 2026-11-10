@@ -750,17 +750,49 @@ const SCHEDULE_PRESETS = [
 // Tasks
 // ---------------------------------------------------------------------------
 
-/** Status filter groups: the board shows one family at a time. */
+/** Board columns, in order. The stage is a workflow position; the execution
+ *  status (active/paused/draft…) stays independent and keeps driving the
+ *  scheduler. */
+const KANBAN_COLUMNS = [
+  {
+    id: 'analysis',
+    label: 'Analysis',
+    hint: 'Needs scope or requirements',
+    accent: 'col-analysis',
+  },
+  {
+    id: 'todo',
+    label: 'To Do',
+    hint: 'Ready to run',
+    accent: 'col-todo',
+  },
+  {
+    id: 'in_progress',
+    label: 'In Progress',
+    hint: 'Running now',
+    accent: 'col-progress',
+  },
+  {
+    id: 'done',
+    label: 'Done',
+    hint: 'Finished work',
+    accent: 'col-done',
+  },
+];
+
+/** Status filters applied on top of the board. */
 const TASK_FILTERS = [
   { id: 'all', label: 'All' },
-  { id: 'active', label: 'Active', statuses: ['active'] },
-  { id: 'draft', label: 'Manual', statuses: ['draft'] },
+  { id: 'scheduled', label: 'Scheduled', statuses: ['active'] },
+  { id: 'manual', label: 'Manual', statuses: ['draft'] },
   { id: 'paused', label: 'Paused', statuses: ['paused'] },
-  { id: 'attention', label: 'Needs attention', statuses: ['failed', 'cancelled'] },
-  { id: 'completed', label: 'Completed', statuses: ['completed'] },
 ];
 
 let taskFilter = sessionStorage.getItem('auren_task_filter') || 'all';
+// Board state survives navigation: which columns are collapsed.
+let collapsedColumns = new Set(
+  (sessionStorage.getItem('auren_kanban_collapsed') || '').split(',').filter(Boolean),
+);
 
 /** The schedule sentence shown on a task card. */
 function taskScheduleLabel(task) {
@@ -785,7 +817,7 @@ function taskTimingHtml(task) {
     const status = task.last_run_status || '';
     items.push(`<span class="task-meta-item">
       <span class="badge ${esc(status)} plain">${esc(status)}</span>
-      <span>last ran ${esc(relativeTime(task.last_run_at))}</span>
+      <span>${esc(relativeTime(task.last_run_at))}</span>
     </span>`);
   } else {
     items.push('<span class="task-meta-item is-idle"><span class="dot"></span>Never ran</span>');
@@ -796,7 +828,7 @@ function taskTimingHtml(task) {
 views.tasks = async (content) => {
   const [agents, { items }] = await Promise.all([
     api('GET', '/agents'),
-    api('GET', '/tasks?limit=100'),
+    api('GET', '/tasks?limit=200'),
   ]);
 
   const activeFilter = TASK_FILTERS.find((f) => f.id === taskFilter) || TASK_FILTERS[0];
@@ -809,10 +841,12 @@ views.tasks = async (content) => {
     count: f.statuses ? items.filter((t) => f.statuses.includes(t.status)).length : items.length,
   }));
 
+  const openForm = (task) => showTaskForm(task, agents.items);
+
   content.innerHTML = `
     ${pageHead(
       'Tasks',
-      'Scheduled work the agent runs for you. Create one here or just ask in Chat.',
+      'Drag cards between columns to track work. Columns are independent of scheduling: a scheduled task keeps firing wherever it sits.',
       '<button class="btn" id="task-new">+ New task</button>',
     )}
     <div class="task-toolbar">
@@ -820,18 +854,12 @@ views.tasks = async (content) => {
         <button class="filter-chip ${f.id === activeFilter.id ? 'active' : ''}" data-filter="${f.id}">
           ${esc(f.label)}${f.count ? ` · ${f.count}` : ''}
         </button>`).join('')}
+      <span class="spacer"></span>
+      <button class="btn btn-sm btn-secondary" id="kanban-expand-all">Expand all</button>
     </div>
-    ${visible.length ? `
-      <div class="task-grid">
-        ${visible.map((t) => taskCardHtml(t)).join('')}
-      </div>`
-      : emptyState(
-          items.length
-            ? 'No tasks match this filter.'
-            : 'No tasks yet. Create one manually or ask the agent in Chat.',
-          '🗒',
-          items.length ? '' : '<button class="btn btn-sm" id="task-empty-new">Create your first task</button>',
-        )}
+    <div class="kanban" id="kanban">
+      ${KANBAN_COLUMNS.map((col) => kanbanColumnHtml(col, visible.filter((t) => (t.stage || 'todo') === col.id))).join('')}
+    </div>
   `;
 
   // Filter chips.
@@ -843,17 +871,40 @@ views.tasks = async (content) => {
     });
   });
 
-  const openForm = (task) => showTaskForm(task, agents.items);
   document.getElementById('task-new').addEventListener('click', () => openForm(null));
-  const emptyNew = document.getElementById('task-empty-new');
-  if (emptyNew) emptyNew.addEventListener('click', () => openForm(null));
+
+  content.querySelectorAll('[data-kanban-new]').forEach((btn) => {
+    btn.addEventListener('click', () => openForm(null));
+  });
+
+  // Column collapse toggles.
+  content.querySelectorAll('[data-collapse]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const col = btn.dataset.collapse;
+      if (collapsedColumns.has(col)) collapsedColumns.delete(col);
+      else collapsedColumns.add(col);
+      sessionStorage.setItem('auren_kanban_collapsed', [...collapsedColumns].join(','));
+      navigate('tasks');
+    });
+  });
+
+  const expandAll = document.getElementById('kanban-expand-all');
+  if (expandAll) {
+    expandAll.addEventListener('click', () => {
+      collapsedColumns.clear();
+      sessionStorage.setItem('auren_kanban_collapsed', '');
+      navigate('tasks');
+    });
+  }
 
   // Per-card actions.
-  content.querySelectorAll('.task-card').forEach((card) => {
+  content.querySelectorAll('.kanban-card').forEach((card) => {
     const task = items.find((t) => t.id === card.dataset.id);
     if (!task) return;
     card.querySelectorAll('[data-action]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
+      btn.addEventListener('click', async (event) => {
+        // Buttons inside a draggable card must not start a drag.
+        event.stopPropagation();
         const action = btn.dataset.action;
         if (action === 'edit') return openForm(task);
         if (action === 'history') return showRunHistory(task);
@@ -886,19 +937,49 @@ views.tasks = async (content) => {
       });
     });
   });
+
+  wireKanbanDrag(content, items);
 };
 
-/** Card markup for one task, with its human-readable schedule summary. */
-function taskCardHtml(task) {
+/** Markup for one board column and the cards it holds. */
+function kanbanColumnHtml(col, cards) {
+  const collapsed = collapsedColumns.has(col.id);
+  return `
+    <section class="kanban-col ${col.accent} ${collapsed ? 'is-collapsed' : ''}" data-col="${col.id}">
+      <header class="kanban-col-head">
+        <span class="kanban-dot" aria-hidden="true"></span>
+        <h3>${esc(col.label)}</h3>
+        <span class="kanban-count">${cards.length}</span>
+        <span class="spacer"></span>
+        <button class="btn-icon" data-collapse="${col.id}"
+          title="${collapsed ? 'Expand' : 'Collapse'} ${esc(col.label)}">${collapsed ? '▸' : '▾'}</button>
+      </header>
+      ${collapsed ? '' : `
+        <div class="kanban-col-hint muted">${esc(col.hint)}</div>
+        <div class="kanban-drop" data-drop="${col.id}">
+          ${cards.length
+            ? cards.map((t) => kanbanCardHtml(t)).join('')
+            : `<div class="kanban-empty">Drop a task here</div>`}
+        </div>
+        <button class="kanban-add" data-kanban-new>+ Add task</button>
+      `}
+    </section>`;
+}
+
+/** Card markup for one task inside a board column. */
+function kanbanCardHtml(task) {
   const isRunning = task.last_run_status === 'running' || task.last_run_status === 'queued';
   const canPause = task.status === 'active';
   const canResume = task.status === 'paused';
+  const closed = task.stage === 'done';
   return `
-    <div class="task-card" data-id="${esc(task.id)}">
-      <div class="task-card-head">
+    <article class="kanban-card ${closed ? 'is-done' : ''}" draggable="true" data-id="${esc(task.id)}"
+      tabindex="0" role="group"
+      aria-label="${esc(task.title)} — stage ${esc(task.stage || 'todo')}"> 
+      <div class="kanban-card-head">
         <div class="task-title">${esc(task.title)}</div>
         <span class="spacer"></span>
-        <span class="badge ${esc(task.status)}">${esc(task.status)}</span>
+        <span class="badge ${esc(task.status)} plain">${esc(task.status)}</span>
       </div>
       <div class="task-objective">${esc(task.objective)}</div>
       <div class="task-meta">
@@ -909,12 +990,99 @@ function taskCardHtml(task) {
         <button class="btn btn-sm" data-action="run" ${isRunning ? 'disabled' : ''}>Run now</button>
         ${canPause ? '<button class="btn btn-sm btn-secondary" data-action="pause">Pause</button>' : ''}
         ${canResume ? '<button class="btn btn-sm btn-secondary" data-action="resume">Resume</button>' : ''}
-        <button class="btn btn-sm btn-secondary" data-action="history">History</button>
-        <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
+        <button class="btn btn-sm btn-secondary" data-action="history" title="Run history">History</button>
+        <button class="btn btn-sm btn-secondary" data-action="edit" title="Edit task">Edit</button>
         <span class="spacer"></span>
         <button class="btn-icon danger" data-action="delete" title="Delete task">✕</button>
       </div>
-    </div>`;
+    </article>`;
+}
+
+/**
+ * Drag and drop between columns. HTML5 drag events are used directly so no
+ * library is needed, and a keyboard fallback (move menu) keeps the board usable
+ * without a mouse.
+ */
+function wireKanbanDrag(content, tasks) {
+  const board = document.getElementById('kanban');
+  if (!board) return;
+  let draggedId = null;
+
+  const cards = content.querySelectorAll('.kanban-card');
+  cards.forEach((card) => {
+    card.addEventListener('dragstart', (event) => {
+      draggedId = card.dataset.id;
+      card.classList.add('is-dragging');
+      event.dataTransfer.effectAllowed = 'move';
+      // Firefox requires data to be set for the drag to start.
+      event.dataTransfer.setData('text/plain', draggedId);
+    });
+    card.addEventListener('dragend', () => {
+      card.classList.remove('is-dragging');
+      draggedId = null;
+      content.querySelectorAll('.kanban-drop').forEach((drop) => drop.classList.remove('is-over'));
+    });
+  });
+
+  content.querySelectorAll('[data-drop]').forEach((drop) => {
+    const column = drop.dataset.drop;
+
+    drop.addEventListener('dragover', (event) => {
+      if (!draggedId) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      drop.classList.add('is-over');
+    });
+    drop.addEventListener('dragleave', () => drop.classList.remove('is-over'));
+
+    drop.addEventListener('drop', async (event) => {
+      event.preventDefault();
+      drop.classList.remove('is-over');
+      const taskId = event.dataTransfer.getData('text/plain') || draggedId;
+      if (!taskId) return;
+      const task = tasks.find((t) => t.id === taskId);
+      if (!task || task.stage === column) return;
+
+      // Optimistic move: the card follows the cursor immediately. On failure
+      // the board is refetched, so a rejected move is never shown as applied.
+      const card = content.querySelector(`.kanban-card[data-id="${taskId}"]`);
+      if (card) drop.appendChild(card);
+
+      try {
+        await api('POST', `/tasks/${taskId}/stage`, { stage: column });
+        toast(`Moved to ${KANBAN_COLUMNS.find((c) => c.id === column)?.label || column}`, 'success');
+        navigate('tasks');
+      } catch (err) {
+        toast(err.message, 'error');
+        navigate('tasks');
+      }
+    });
+  });
+
+  // Keyboard accessibility: the board must be usable without a mouse.
+  // Arrow keys move the focused card between columns.
+  content.querySelectorAll('.kanban-card').forEach((card) => {
+    const task = tasks.find((t) => t.id === card.dataset.id);
+    if (!task) return;
+    card.addEventListener('keydown', (event) => {
+      const order = KANBAN_COLUMNS.map((c) => c.id);
+      const index = order.indexOf(task.stage || 'todo');
+      let next = null;
+      if (event.key === 'ArrowRight') next = order[Math.min(index + 1, order.length - 1)];
+      else if (event.key === 'ArrowLeft') next = order[Math.max(index - 1, 0)];
+      if (!next || next === task.stage) return;
+      // Only intercept the keys on the card itself, never on inner controls.
+      if (event.target !== card) return;
+      event.preventDefault();
+
+      api('POST', `/tasks/${task.id}/stage`, { stage: next })
+        .then(() => {
+          toast(`Moved to ${KANBAN_COLUMNS.find((c) => c.id === next)?.label}`, 'success');
+          navigate('tasks');
+        })
+        .catch((err) => toast(err.message, 'error'));
+    });
+  });
 }
 
 /**

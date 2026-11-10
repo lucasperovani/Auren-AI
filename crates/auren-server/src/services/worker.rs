@@ -45,13 +45,24 @@ pub async fn tick_once(state: &AppState, worker_id: &str) -> anyhow::Result<()> 
             .await?;
         let run_id: String = run_row.get("task_run_id");
 
-        // Mark the run running and execute it.
+        // Mark the run running and execute it. A task that starts running
+        // moves to In Progress on the board, so the user sees live work
+        // without touching the card.
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query("UPDATE task_runs SET status = 'running', started_at = ? WHERE id = ?")
             .bind(&now)
             .bind(&run_id)
             .execute(&state.db)
             .await?;
+        sqlx::query(
+            "UPDATE tasks SET stage = 'in_progress', updated_at = ?
+             WHERE id = (SELECT task_id FROM task_runs WHERE id = ?)
+               AND stage IN ('analysis', 'todo')",
+        )
+        .bind(&now)
+        .bind(&run_id)
+        .execute(&state.db)
+        .await?;
 
         // Execute through the bounded agent runtime: it plans with the LLM
         // when a provider is configured, and falls back to recorded steps
