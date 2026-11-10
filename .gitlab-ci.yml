@@ -1,8 +1,13 @@
 # GitLab CI — builds and publishes the aarch64 image with the app-announcer.
 #
-# Only aarch64 is produced here: the runtime base image
+# Why a native arm64 runner: the runtime base image
 # (registry.gitlab.com/lucas.perovani/app-announcer) is arm64, so the final
-# image must match. Desktop builds for other platforms live in GitHub Actions.
+# image must be arm64. Building that on an x86 runner requires QEMU emulation
+# for every compilation step — roughly 10-20x slower, and QEMU frequently
+# breaks on Rust build scripts. `saas-linux-small-arm64` is available on the
+# free tier, so the job runs natively instead.
+#
+# Desktop builds for other platforms live in GitHub Actions.
 #
 # Required CI/CD variables (Settings → CI/CD → Variables):
 #   CI_REGISTRY_*     provided automatically by GitLab
@@ -11,12 +16,10 @@ stages:
   - build
 
 variables:
-  # vfs avoids overlay-on-overlay failures inside container executors.
-  STORAGE_DRIVER: vfs
   TARGET: aarch64-unknown-linux-musl
   IMAGE_TAG: latest
-  # Buildah keeps its images and layer cache in $HOME by default. Pointing it
-  # at the project directory lets GitLab's cache preserve them between jobs.
+  # Buildah keeps its store in $HOME by default. Pointing it at the project
+  # directory lets GitLab's cache preserve images and layer cache between jobs.
   BUILDAH_STORE: "$CI_PROJECT_DIR/.buildah"
 
 # Persist buildah's store between jobs. The key follows the two files that
@@ -32,10 +35,15 @@ cache:
 
 build-arm64:
   stage: build
+  # Native arm64 runner: no emulation, so the Rust toolchain and every build
+  # script run at full speed. Privileged by default, which buildah needs.
+  tags:
+    - saas-linux-small-arm64
   image: quay.io/buildah/stable:latest
   variables:
-    # buildah needs the fuse overlay driver to be usable by a non-root user;
-    # vfs plus --isolation=chroot keeps it working inside the runner container.
+    # The overlay driver needs a privileged runner; vfs works everywhere and
+    # avoids "overlay on overlay" failures inside the executor container.
+    STORAGE_DRIVER: vfs
     BUILDAH_ISOLATION: chroot
   before_script:
     - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
@@ -48,21 +56,16 @@ build-arm64:
     # "should be a string or a nested array of strings".
     - if [ -d "$BUILDAH_STORE" ]; then du -sh "$BUILDAH_STORE"; else echo "cache cold, building from scratch"; fi
   script:
-    # --arch aarch64 makes the final image arm64 even when the runner is amd64,
-    # and the musl target produces a static binary for that architecture.
+    # NOTE on caching flags: buildah rejects a tag in `--cache-from` and
+    # `--cache-to` ("repository must contain neither a tag nor digest"),
+    # unlike docker buildx. Both are omitted here.
     #
-    # --layers caches each Dockerfile instruction. --cache-from reuses layers
-    # from the previously pushed image, so only changed stages rebuild.
-    #
-    # NOTE: --cache-to must NOT include a tag — buildah rejects it with
-    # "repository must contain neither a tag nor digest". The cache is keyed by
-    # content, not by reference, so the bare repository path is enough.
+    # Layer reuse comes from the persisted buildah store (`--layers` plus the
+    # `cache:` block above): the Dockerfile is written so a code-only change
+    # reuses the dependency layer, which is where nearly all the time goes.
     - >
       buildah build
-      --arch aarch64
       --layers
-      --cache-from "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
-      --cache-to "$CI_REGISTRY_IMAGE"
       --build-arg TARGET=$TARGET
       -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
       -f Dockerfile .

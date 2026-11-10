@@ -14,7 +14,16 @@
 # Chromium, which `web_navigate` needs, is ~180 MB and is therefore *opt-in*:
 # build with `--build-arg WITH_BROWSER=true` only when you need JavaScript
 # rendering. Everything else (search, fetch, the whole app) works without it.
-FROM rust:1.85-alpine AS builder
+#
+# `--platform=linux/arm64` pins the builder image architecture. Without it,
+# `rust:1.97-alpine` resolves to the *runner's* architecture, so on an x86 host
+# the toolchain would be amd64 while TARGET asks for aarch64 — producing either
+# a cross-compile (slow, and openssl-src needs extra setup) or a broken build.
+# Pinning makes the build native wherever it runs.
+#
+# The image version must satisfy the workspace MSRV (Cargo.toml
+# `rust-version`), which the locked dependencies raise to 1.89.
+FROM --platform=linux/arm64 rust:1.97-alpine AS builder
 ARG TARGET=aarch64-unknown-linux-musl
 
 # musl-dev/perl serve ring and openssl-src; git for crates.io git dependencies.
@@ -64,8 +73,11 @@ RUN RUSTFLAGS="-C target-feature=+crt-static" \
 # ---------------------------------------------------------------------------
 # Compression stage: UPX on a static musl binary typically halves it.
 # Kept in its own stage so the UPX toolchain never reaches the runtime image.
+#
+# Pinned to arm64: UPX is an executable that rewrites the binary, so it must
+# run on the architecture of the binary it compresses.
 # ---------------------------------------------------------------------------
-FROM alpine:3.21 AS compress
+FROM --platform=linux/arm64 alpine:3.21 AS compress
 ARG TARGET=aarch64-unknown-linux-musl
 RUN apk add --no-cache upx
 COPY --from=builder /build/target/${TARGET}/release/auren-server /auren-server
@@ -75,8 +87,9 @@ RUN upx --best --lzma --force /auren-server
 
 # ---------------------------------------------------------------------------
 # Runtime: app-announcer supervises the server and announces it on the LAN.
+# The base image is arm64 only, which is why the whole build targets arm64.
 # ---------------------------------------------------------------------------
-FROM registry.gitlab.com/lucas.perovani/app-announcer:latest
+FROM --platform=linux/arm64 registry.gitlab.com/lucas.perovani/app-announcer:latest
 ARG TARGET=aarch64-unknown-linux-musl
 ARG WITH_BROWSER=false
 

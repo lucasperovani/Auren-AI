@@ -6,7 +6,11 @@ members = ["crates/auren-server"]
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-rust-version = "1.85"
+# Minimum supported Rust version. Must match what the locked dependencies
+# actually require: `uuid` 1.28 needs 1.89, and the ICU crates need 1.88.
+# Keeping this accurate lets Cargo fail with a clear message instead of a
+# confusing dependency error deep in a build.
+rust-version = "1.89"
 
 # Release tuning aimed at the smallest possible shipped binary. The server is a
 # long-lived process, so slower codegen and LTO are paid once at build time.
