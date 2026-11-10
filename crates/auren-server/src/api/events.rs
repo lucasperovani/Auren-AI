@@ -78,7 +78,11 @@ async fn handle_socket(state: AppState, socket: WebSocket, ticket: WsTicket) {
 
     // Forward live events to the client.
     let mut send_task = tokio::spawn(async move {
-        let mut ping = tokio::time::interval(PING_INTERVAL);
+        // `interval` fires its first tick immediately; `interval_at` starts
+        // the countdown at the full period so a fresh connection is not
+        // greeted by a control frame before any event.
+        let start = tokio::time::Instant::now() + PING_INTERVAL;
+        let mut ping = tokio::time::interval_at(start, PING_INTERVAL);
         loop {
             tokio::select! {
                 event = event_rx.recv() => {

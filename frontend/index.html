@@ -26,22 +26,24 @@
     <!-- Main application -->
     <div id="main-view" class="hidden">
       <header class="topbar">
-        <button class="menu-toggle" id="menu-toggle" aria-label="Menu">☰</button>
+        <button class="menu-toggle" id="menu-toggle" aria-label="Toggle menu">☰</button>
         <span class="brand">Auren-AI</span>
-        <button class="btn-ghost" id="sidebar-collapse" title="Hide/show menu">◀</button>
+        <button class="btn-ghost" id="sidebar-collapse" title="Show or hide the menu">◀</button>
         <span class="spacer"></span>
-        <span id="connection-status" class="conn-status" title="Live events">●</span>
-        <span id="user-name" class="muted"></span>
+        <span id="connection-status" class="conn-status" title="Live event channel">Offline</span>
+        <span id="user-name" class="user-name"></span>
         <button id="logout-btn" class="btn-ghost">Sign out</button>
       </header>
       <nav class="sidebar" id="sidebar">
-        <a href="#dashboard" class="nav-link active" data-view="dashboard">Dashboard</a>
-        <a href="#chat" class="nav-link" data-view="chat">Chat</a>
-        <a href="#tasks" class="nav-link" data-view="tasks">Tasks</a>
-        <a href="#skills" class="nav-link" data-view="skills">Skills</a>
-        <a href="#integrations" class="nav-link" data-view="integrations">Integrations</a>
-        <a href="#approvals" class="nav-link" data-view="approvals">Approvals<span id="approvals-badge" class="nav-badge hidden"></span></a>
-        <a href="#settings" class="nav-link" data-view="settings">Settings</a>
+        <div class="nav-section">Workspace</div>
+        <a href="#dashboard" class="nav-link active" data-view="dashboard"><span class="nav-icon">◈</span>Dashboard</a>
+        <a href="#chat" class="nav-link" data-view="chat"><span class="nav-icon">✎</span>Chat</a>
+        <a href="#tasks" class="nav-link" data-view="tasks"><span class="nav-icon">◷</span>Tasks</a>
+        <a href="#approvals" class="nav-link" data-view="approvals"><span class="nav-icon">✓</span>Approvals<span id="approvals-badge" class="nav-badge hidden"></span></a>
+        <div class="nav-section">Configure</div>
+        <a href="#skills" class="nav-link" data-view="skills"><span class="nav-icon">◆</span>Skills</a>
+        <a href="#integrations" class="nav-link" data-view="integrations"><span class="nav-icon">⇄</span>Integrations</a>
+        <a href="#settings" class="nav-link" data-view="settings"><span class="nav-icon">⚙</span>Settings</a>
       </nav>
       <main class="content" id="content"></main>
     </div>

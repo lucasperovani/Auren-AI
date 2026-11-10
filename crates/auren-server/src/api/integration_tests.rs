@@ -490,3 +490,101 @@ async fn notifications_lifecycle() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["read_at"].is_string());
 }
+
+/// The task payload carries everything the UI needs to describe a schedule in
+/// plain language: the cron, the next fire time, and the latest run.
+#[tokio::test]
+async fn task_payload_exposes_schedule_and_last_run() {
+    let (app, _s, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+
+    let (status, scheduled) = post_json(
+        &app,
+        "/api/v1/tasks",
+        Some(&token),
+        json!({ "agent_id": agent_id, "title": "T", "objective": "O", "schedule": { "cron": "0 9 * * 1-5" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(scheduled["schedule_cron"], "0 9 * * 1-5");
+    assert!(scheduled["next_run_at"].is_string());
+    assert!(scheduled["last_run_at"].is_null());
+
+    let (status, manual) = post_json(
+        &app,
+        "/api/v1/tasks",
+        Some(&token),
+        json!({ "agent_id": agent_id, "title": "M", "objective": "O" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(manual["schedule_cron"].is_null());
+    assert!(manual["next_run_at"].is_null());
+
+    // Listing joins the same fields, so the board needs no extra requests.
+    let (status, list) = get_json(&app, "/api/v1/tasks?limit=10", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = list["items"].as_array().unwrap().iter()
+        .find(|t| t["title"] == "T").expect("scheduled task listed");
+    assert_eq!(item["schedule_cron"], "0 9 * * 1-5");
+    assert!(item["next_run_at"].is_string());
+}
+
+/// PATCH with an explicit `null` schedule removes the schedule; omitting the
+/// field leaves the existing schedule untouched.
+#[tokio::test]
+async fn task_schedule_can_be_removed_or_left_untouched() {
+    let (app, _s, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let (_, task) = post_json(
+        &app,
+        "/api/v1/tasks",
+        Some(&token),
+        json!({ "agent_id": agent_id, "title": "T", "objective": "O", "schedule": { "cron": "0 9 * * *" } }),
+    )
+    .await;
+    let task_id = task["id"].as_str().unwrap().to_string();
+    assert_eq!(task["status"], "active");
+
+    // Renaming without a schedule field keeps the schedule.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/tasks/{task_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "title": "Renamed" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["title"], "Renamed");
+    assert_eq!(body["schedule_cron"], "0 9 * * *");
+    assert!(body["next_run_at"].is_string());
+
+    // An explicit null clears it and drops the task to on-demand.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/tasks/{task_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "schedule": null }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["schedule_cron"].is_null());
+    assert!(body["next_run_at"].is_null());
+    assert_eq!(body["status"], "draft");
+}

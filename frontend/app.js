@@ -6,6 +6,8 @@ let sessionToken = sessionStorage.getItem('auren_token') || '';
 let currentUser = null;
 let ws = null;
 let wsReconnectDelay = 1000;
+// Model cache for the chat model picker, refreshed per render.
+let chatModels = {};
 
 // ---------------------------------------------------------------------------
 // API helpers
@@ -56,6 +58,177 @@ function esc(text) {
   const div = document.createElement('div');
   div.textContent = text ?? '';
   return div.innerHTML;
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers: users never see raw cron expressions or ISO timestamps.
+// ---------------------------------------------------------------------------
+
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const DAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+const dateTimeFmt = new Intl.DateTimeFormat('en', {
+  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+});
+const clockFmt = new Intl.DateTimeFormat('en', {
+  hour: '2-digit', minute: '2-digit', hour12: false,
+});
+const relativeFmt = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
+
+/** Parse a cron field into a number, or null when it is not a plain value. */
+function cronInt(value) {
+  return /^\d+$/.test(value) ? Number(value) : null;
+}
+
+/** Step of a `*\/n` field, or null. */
+function cronStep(value) {
+  const match = /^\*\/(\d+)$/.exec(value ?? '');
+  return match ? Number(match[1]) : null;
+}
+
+/** Ordinal suffix: 1 -> 1st, 22 -> 22nd. */
+function ordinal(n) {
+  const rem100 = n % 100;
+  if (rem100 >= 11 && rem100 <= 13) return `${n}th`;
+  return `${n}${['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`;
+}
+
+/** Expand `1-5` or `1,3,5` into day numbers; null when not a day list. */
+function cronDayList(field) {
+  const parts = field.split(',');
+  const days = [];
+  for (const part of parts) {
+    if (part.includes('-')) {
+      const [start, end] = part.split('-').map(Number);
+      if (Number.isNaN(start) || Number.isNaN(end) || end < start) return null;
+      for (let d = start; d <= end; d += 1) days.push(d % 7);
+    } else {
+      const day = cronInt(part);
+      if (day === null) return null;
+      days.push(day % 7);
+    }
+  }
+  return days.length ? [...new Set(days)].sort((a, b) => a - b) : null;
+}
+
+/** "Mon, Wed and Fri" for a set of weekday numbers. */
+function describeDays(days) {
+  const names = days.map((d) => DAY_SHORT[d]);
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/**
+ * Turn a 5-field cron expression into plain English. Falls back to a generic
+ * label for expressions outside the supported subset, so the raw expression
+ * is never surfaced as the primary description.
+ */
+function describeCron(expression) {
+  if (!expression) return 'Manual only';
+  const fields = String(expression).trim().split(/\s+/);
+  if (fields.length !== 5) return 'Custom schedule';
+  const [minute, hour, dom, month, dow] = fields;
+
+  const minuteValue = cronInt(minute);
+  const hourValue = cronInt(hour);
+  const minuteStep = cronStep(minute);
+  const hourStep = cronStep(hour);
+  const time = (h, m = minuteValue) => `${pad2(h)}:${pad2(m)}`;
+  const daily = dom === '*' && month === '*' && dow === '*';
+
+  // Intra-hour and hourly patterns.
+  if (hour === '*' && daily) {
+    if (minute === '*' || minuteStep === 1) return 'Every minute';
+    if (minuteStep) return `Every ${minuteStep} minutes`;
+    if (minuteValue === 0) return 'Every hour, on the hour';
+    if (minuteValue !== null) return `Every hour at :${pad2(minuteValue)}`;
+    return 'Every hour';
+  }
+
+  // Sub-daily step patterns such as `0 */6 * * *`.
+  if (hourStep && minuteValue !== null && daily) {
+    return hourStep === 1
+      ? `Every hour${minuteValue ? ` at :${pad2(minuteValue)}` : ', on the hour'}`
+      : `Every ${hourStep} hours`;
+  }
+
+  if (minuteValue === null || hourValue === null) return 'Custom schedule';
+
+  if (daily) return `Every day at ${time(hourValue)}`;
+
+  // Weekly / weekday patterns.
+  if (dom === '*' && month === '*') {
+    const days = cronDayList(dow);
+    if (days) {
+      if (days.length === 5 && days.join() === '1,2,3,4,5') return `Weekdays at ${time(hourValue)}`;
+      if (days.length === 2 && days.join() === '0,6') return `Weekends at ${time(hourValue)}`;
+      if (days.length === 1) return `Every ${DAY_NAMES[days[0]]} at ${time(hourValue)}`;
+      return `Every ${describeDays(days)} at ${time(hourValue)}`;
+    }
+  }
+
+  // Monthly / yearly patterns.
+  const domValue = cronInt(dom);
+  if (domValue !== null && dow === '*') {
+    if (month === '*') return `Monthly on the ${ordinal(domValue)} at ${time(hourValue)}`;
+    const monthValue = cronInt(month);
+    if (monthValue !== null && monthValue >= 1 && monthValue <= 12) {
+      return `Every year on ${MONTH_NAMES[monthValue - 1]} ${domValue} at ${time(hourValue)}`;
+    }
+  }
+
+  return 'Custom schedule';
+}
+
+/** Short absolute timestamp, e.g. "Nov 10, 14:32". */
+function formatDateTime(iso) {
+  if (!iso) return '—';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '—';
+  return dateTimeFmt.format(date);
+}
+
+/** Clock time only, e.g. "14:32". */
+function formatClock(iso) {
+  if (!iso) return '—';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '—';
+  return clockFmt.format(date);
+}
+
+/** Relative description such as "in 3 hours" or "2 days ago". */
+function relativeTime(iso) {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const seconds = Math.round((date.getTime() - Date.now()) / 1000);
+  const abs = Math.abs(seconds);
+  if (abs < 45) return relativeFmt.format(0, 'second');
+  if (abs < 2700) return relativeFmt.format(Math.round(seconds / 60), 'minute');
+  if (abs < 79200) return relativeFmt.format(Math.round(seconds / 3600), 'hour');
+  if (abs < 2592000) return relativeFmt.format(Math.round(seconds / 86400), 'day');
+  if (abs < 31536000) return relativeFmt.format(Math.round(seconds / 2592000), 'month');
+  return relativeFmt.format(Math.round(seconds / 31536000), 'year');
+}
+
+/** Duration between two instants, e.g. "4.2s" or "1m 12s". */
+function formatDuration(startIso, endIso) {
+  if (!startIso) return '';
+  const start = new Date(startIso).getTime();
+  const end = endIso ? new Date(endIso).getTime() : Date.now();
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return '';
+  const totalSeconds = (end - start) / 1000;
+  if (totalSeconds < 1) return `${Math.round(totalSeconds * 1000)}ms`;
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.round(totalSeconds % 60);
+  return `${minutes}m ${seconds}s`;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,33 +393,75 @@ async function refreshApprovalsBadge() {
 
 views.dashboard = async (content) => {
   const [tasks, skills, integrations, approvals, notifications] = await Promise.all([
-    api('GET', '/tasks?limit=5'),
+    api('GET', '/tasks?limit=100'),
     api('GET', '/skills'),
     api('GET', '/integrations'),
     api('GET', '/approvals?status=pending'),
     api('GET', '/notifications?limit=5'),
   ]);
-  const activeTasks = tasks.items.filter((t) => t.status === 'active' || t.status === 'draft').length;
+
+  const activeTasks = tasks.items.filter((t) => t.status === 'active').length;
+  const scheduled = tasks.items.filter((t) => t.schedule_cron && t.status === 'active').length;
+  const failing = tasks.items.filter((t) => t.last_run_status === 'failed').length;
+  const recent = [...tasks.items]
+    .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))
+    .slice(0, 5);
+
   content.innerHTML = `
-    <h2 class="section-title">Dashboard</h2>
+    ${pageHead('Dashboard', `Signed in as ${currentUser?.display_name || 'you'}.`)}
     <div class="grid">
-      <div class="card"><div class="stat">${activeTasks}</div><div class="stat-label">Active tasks</div></div>
-      <div class="card"><div class="stat">${approvals.items.length}</div><div class="stat-label">Pending approvals</div></div>
-      <div class="card"><div class="stat">${skills.items.length}</div><div class="stat-label">Installed skills</div></div>
-      <div class="card"><div class="stat">${integrations.items.length}</div><div class="stat-label">Integrations</div></div>
+      <div class="card stat-card interactive">
+        <div class="stat-icon">◷</div>
+        <div class="stat stat-accent">${activeTasks}</div>
+        <div class="stat-label">Active tasks${scheduled ? ` · ${scheduled} scheduled` : ''}</div>
+      </div>
+      <div class="card stat-card interactive">
+        <div class="stat-icon">✓</div>
+        <div class="stat ${approvals.items.length ? 'stat-warning' : ''}">${approvals.items.length}</div>
+        <div class="stat-label">Pending approvals</div>
+      </div>
+      <div class="card stat-card interactive">
+        <div class="stat-icon">◆</div>
+        <div class="stat stat-success">${skills.items.length}</div>
+        <div class="stat-label">Installed skills</div>
+      </div>
+      <div class="card stat-card interactive">
+        <div class="stat-icon">⇄</div>
+        <div class="stat ${failing ? 'stat-danger' : ''}">${integrations.items.length}</div>
+        <div class="stat-label">Integrations${failing ? ` · ${failing} failing` : ''}</div>
+      </div>
     </div>
-    <h3 class="section-title">Recent tasks</h3>
-    ${tasks.items.length ? `<table class="table">
-      <thead><tr><th>Task</th><th>Status</th><th>Updated</th></tr></thead>
-      <tbody>${tasks.items.map((t) => `
-        <tr><td><a href="#tasks">${esc(t.title)}</a></td>
-        <td><span class="badge ${esc(t.status)}">${esc(t.status)}</span></td>
-        <td class="muted">${esc(t.updated_at)}</td></tr>`).join('')}
-      </tbody></table>` : '<div class="empty-state">No tasks yet. Create one from the Chat view.</div>'}
-    <h3 class="section-title">Recent notifications</h3>
+
+    <div class="section-head">
+      <h3 class="section-title">Recent tasks</h3>
+      <span class="spacer"></span>
+      <a href="#tasks" class="btn btn-sm btn-secondary">View all</a>
+    </div>
+    ${recent.length ? `<table class="table">
+      <thead><tr><th>Task</th><th>Status</th><th>Runs</th><th>Updated</th></tr></thead>
+      <tbody>${recent.map((t) => `
+        <tr>
+          <td><a href="#tasks">${esc(t.title)}</a>
+            <div class="muted" style="font-size:.8rem">${esc(taskScheduleLabel(t))}</div></td>
+          <td><span class="badge ${esc(t.status)}">${esc(t.status)}</span></td>
+          <td class="muted">${esc(t.last_run_status || 'never')}</td>
+          <td class="muted">${esc(relativeTime(t.updated_at))}</td>
+        </tr>`).join('')}
+      </tbody></table>`
+      : emptyState('No tasks yet. Create one from the Tasks view or ask the agent in Chat.', '🗒')}
+
+    <div class="section-head">
+      <h3 class="section-title">Recent activity</h3>
+    </div>
     ${notifications.items.length ? notifications.items.map((n) => `
-      <div class="card" style="margin-bottom:8px"><strong>${esc(n.title)}</strong>
-      <div class="muted">${esc(n.body)}</div></div>`).join('') : '<div class="empty-state">No notifications.</div>'}
+      <div class="card" style="margin-bottom:10px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <strong>${esc(n.title)}</strong>
+          <span class="spacer"></span>
+          <span class="muted" style="font-size:.8rem">${esc(relativeTime(n.created_at))}</span>
+        </div>
+        <div class="muted" style="font-size:.87rem;margin-top:4px">${esc(n.body || '')}</div>
+      </div>`).join('') : emptyState('No notifications yet.', '✉')}
   `;
 };
 
@@ -289,7 +504,7 @@ views.chat = async (content) => {
               <div class="chat-list-row">
                 <div class="chat-list-text">
                   <div class="chat-list-title">${esc(c.title || 'New chat')}</div>
-                  <div class="chat-list-meta muted">${esc((c.updated_at || '').slice(0, 16).replace('T', ' '))}</div>
+                  <div class="chat-list-meta muted">${esc(relativeTime(c.updated_at))}</div>
                 </div>
                 <button class="chat-delete" data-delete="${esc(c.id)}" title="Delete chat">✕</button>
               </div>
@@ -447,120 +662,365 @@ views.chat = async (content) => {
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
 };
 
-// Model cache for the chat model picker, refreshed per render.
-let chatModels = {};
+// ---------------------------------------------------------------------------
+// Shared UI helpers
+// ---------------------------------------------------------------------------
+
+/** Page header with title, subtitle and right-aligned actions. */
+function pageHead(title, subtitle, actionsHtml = '') {
+  return `
+    <div class="page-head">
+      <div>
+        <h2>${esc(title)}</h2>
+        ${subtitle ? `<div class="page-sub">${esc(subtitle)}</div>` : ''}
+      </div>
+      ${actionsHtml ? `<div class="page-actions">${actionsHtml}</div>` : ''}
+    </div>`;
+}
+
+/** Empty state placeholder with an icon and an optional call to action. */
+function emptyState(message, icon = '✦', actionHtml = '') {
+  return `<div class="empty-state">
+    <div class="empty-icon">${icon}</div>
+    <div>${esc(message)}</div>
+    ${actionHtml}
+  </div>`;
+}
+
+/** Open a modal dialog; resolves with the element when closed. */
+function openModal({ title, bodyHtml, footerHtml }) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <div class="modal-head">
+        <h3>${esc(title)}</h3>
+        <span class="spacer"></span>
+        <button class="btn-icon" data-close aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">${bodyHtml}</div>
+      ${footerHtml ? `<div class="modal-foot">${footerHtml}</div>` : ''}
+    </div>`;
+  const close = () => {
+    backdrop.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (event) => { if (event.key === 'Escape') close(); };
+  backdrop.addEventListener('click', (event) => {
+    if (event.target === backdrop || event.target.closest('[data-close]')) close();
+  });
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(backdrop);
+  return { root: backdrop, close };
+}
+
+/** Preset schedules offered in the task form: label, cron, help text. */
+const SCHEDULE_PRESETS = [
+  { label: 'Hourly', cron: '0 * * * *', hint: 'At the start of every hour' },
+  { label: 'Daily', cron: '0 9 * * *', hint: 'Every day at 09:00' },
+  { label: 'Weekdays', cron: '0 9 * * 1-5', hint: 'Monday to Friday at 09:00' },
+  { label: 'Weekly', cron: '0 9 * * 1', hint: 'Every Monday at 09:00' },
+  { label: 'Monthly', cron: '0 9 1 * *', hint: 'On the 1st of each month' },
+];
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+/** Status filter groups: the board shows one family at a time. */
+const TASK_FILTERS = [
+  { id: 'all', label: 'All' },
+  { id: 'active', label: 'Active', statuses: ['active'] },
+  { id: 'draft', label: 'Manual', statuses: ['draft'] },
+  { id: 'paused', label: 'Paused', statuses: ['paused'] },
+  { id: 'attention', label: 'Needs attention', statuses: ['failed', 'cancelled'] },
+  { id: 'completed', label: 'Completed', statuses: ['completed'] },
+];
+
+let taskFilter = sessionStorage.getItem('auren_task_filter') || 'all';
+
+/** The schedule sentence shown on a task card. */
+function taskScheduleLabel(task) {
+  if (!task.schedule_cron) return 'Manual run only';
+  return describeCron(task.schedule_cron);
+}
+
+/** One-line summary of when the task runs next / last ran. */
+function taskTimingHtml(task) {
+  const items = [];
+  if (task.schedule_cron) {
+    if (task.next_run_at && task.status === 'active') {
+      const dueSoon = new Date(task.next_run_at).getTime() - Date.now() < 60 * 60 * 1000;
+      items.push(`<span class="task-meta-item ${dueSoon ? 'is-due' : ''}">
+        <span class="dot"></span><strong>Next</strong> ${esc(relativeTime(task.next_run_at))}
+      </span>`);
+    } else if (task.status === 'paused') {
+      items.push(`<span class="task-meta-item is-idle"><span class="dot"></span>Paused</span>`);
+    }
+  }
+  if (task.last_run_at) {
+    const status = task.last_run_status || '';
+    items.push(`<span class="task-meta-item">
+      <span class="badge ${esc(status)} plain">${esc(status)}</span>
+      <span>last ran ${esc(relativeTime(task.last_run_at))}</span>
+    </span>`);
+  } else {
+    items.push('<span class="task-meta-item is-idle"><span class="dot"></span>Never ran</span>');
+  }
+  return items.join('');
+}
+
 views.tasks = async (content) => {
   const [agents, { items }] = await Promise.all([
     api('GET', '/agents'),
     api('GET', '/tasks?limit=100'),
   ]);
 
+  const activeFilter = TASK_FILTERS.find((f) => f.id === taskFilter) || TASK_FILTERS[0];
+  const visible = activeFilter.statuses
+    ? items.filter((t) => activeFilter.statuses.includes(t.status))
+    : items;
+
+  const counts = TASK_FILTERS.map((f) => ({
+    ...f,
+    count: f.statuses ? items.filter((t) => f.statuses.includes(t.status)).length : items.length,
+  }));
+
   content.innerHTML = `
-    <div style="display:flex; align-items:center; gap:12px">
-      <h2 class="section-title" style="margin:0">Tasks</h2>
-      <button class="btn" id="task-new">+ New task</button>
+    ${pageHead(
+      'Tasks',
+      'Scheduled work the agent runs for you. Create one here or just ask in Chat.',
+      '<button class="btn" id="task-new">+ New task</button>',
+    )}
+    <div class="task-toolbar">
+      ${counts.map((f) => `
+        <button class="filter-chip ${f.id === activeFilter.id ? 'active' : ''}" data-filter="${f.id}">
+          ${esc(f.label)}${f.count ? ` · ${f.count}` : ''}
+        </button>`).join('')}
     </div>
-    <div id="task-form-container"></div>
-    ${items.length ? `<table class="table">
-      <thead><tr><th>Name</th><th>Status</th><th>Schedule</th><th>Actions</th></tr></thead>
-      <tbody>${items.map((t) => `
-        <tr data-id="${esc(t.id)}">
-          <td><strong>${esc(t.title)}</strong><div class="muted">${esc(t.objective)}</div></td>
-          <td><span class="badge ${esc(t.status)}">${esc(t.status)}</span></td>
-          <td class="muted">${t.schedule ? esc(t.schedule.cron || '') : '—'}</td>
-          <td>
-            <button class="btn btn-sm btn-secondary" data-action="run">Run</button>
-            <button class="btn btn-sm btn-secondary" data-action="pause">Pause</button>
-            <button class="btn btn-sm btn-secondary" data-action="resume">Resume</button>
-            <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
-            <button class="btn btn-sm btn-secondary" data-action="history">History</button>
-            <button class="btn btn-sm btn-danger" data-action="delete">Delete</button>
-            <button class="btn btn-sm btn-danger" data-action="cancel">Cancel</button>
-          </td>
-        </tr>`).join('')}
-      </tbody></table>` : '<div class="empty-state">No tasks yet. Create one manually or ask the agent in Chat.</div>'}
+    ${visible.length ? `
+      <div class="task-grid">
+        ${visible.map((t) => taskCardHtml(t)).join('')}
+      </div>`
+      : emptyState(
+          items.length
+            ? 'No tasks match this filter.'
+            : 'No tasks yet. Create one manually or ask the agent in Chat.',
+          '🗒',
+          items.length ? '' : '<button class="btn btn-sm" id="task-empty-new">Create your first task</button>',
+        )}
   `;
 
-  // Inline create/edit form.
-  const formContainer = document.getElementById('task-form-container');
-  const showForm = (task) => {
-    const isEdit = Boolean(task);
-    formContainer.innerHTML = `
-      <div class="card" style="margin:16px 0; max-width:560px">
-        <h3>${isEdit ? 'Edit task' : 'New task'}</h3>
-        <div class="form-row" style="margin-top:12px">
-          <input id="task-title" placeholder="Title" value="${esc(task?.title || '')}">
-          <textarea id="task-objective" placeholder="Objective (what should the agent do?)">${esc(task?.objective || '')}</textarea>
-          <select id="task-agent">${agents.items.map((a) => `<option value="${esc(a.id)}" ${task?.agent_id === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
-          <input id="task-cron" placeholder="Schedule (cron, empty = manual only)" value="${esc(task?.schedule?.cron || '')}">
-          <div style="display:flex; gap:8px">
-            <button class="btn" id="task-save">${isEdit ? 'Save changes' : 'Create task'}</button>
-            <button class="btn btn-secondary" id="task-cancel-form">Cancel</button>
-          </div>
-        </div>
-      </div>`;
-    document.getElementById('task-cancel-form').addEventListener('click', () => { formContainer.innerHTML = ''; });
-    document.getElementById('task-save').addEventListener('click', async () => {
-      const title = document.getElementById('task-title').value.trim();
-      const objective = document.getElementById('task-objective').value.trim();
-      const agentId = document.getElementById('task-agent').value;
-      const cron = document.getElementById('task-cron').value.trim();
-      if (!title || !objective) { toast('Title and objective are required', 'error'); return; }
-      if (!agentId) { toast('Create an agent first (Chat view)', 'error'); return; }
-      const body = { title, objective, agent_id: agentId };
-      if (cron) body.schedule = { cron };
-      try {
-        if (isEdit) {
-          await api('PATCH', `/tasks/${task.id}`, body);
-          toast('Task updated', 'success');
-        } else {
-          await api('POST', '/tasks', body);
-          toast('Task created', 'success');
-        }
-        navigate('tasks');
-      } catch (err) { toast(err.message, 'error'); }
+  // Filter chips.
+  content.querySelectorAll('[data-filter]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      taskFilter = chip.dataset.filter;
+      sessionStorage.setItem('auren_task_filter', taskFilter);
+      navigate('tasks');
     });
-  };
-  document.getElementById('task-new').addEventListener('click', () => showForm(null));
+  });
 
-  content.querySelectorAll('tr[data-id] button').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const taskId = btn.closest('tr').dataset.id;
-      const action = btn.dataset.action;
-      try {
-        if (action === 'edit') {
-          const task = items.find((t) => t.id === taskId);
-          showForm(task);
-          return;
-        }
-        if (action === 'history') {
-          showRunHistory(taskId, items.find((t) => t.id === taskId));
-          return;
-        }
+  const openForm = (task) => showTaskForm(task, agents.items);
+  document.getElementById('task-new').addEventListener('click', () => openForm(null));
+  const emptyNew = document.getElementById('task-empty-new');
+  if (emptyNew) emptyNew.addEventListener('click', () => openForm(null));
+
+  // Per-card actions.
+  content.querySelectorAll('.task-card').forEach((card) => {
+    const task = items.find((t) => t.id === card.dataset.id);
+    if (!task) return;
+    card.querySelectorAll('[data-action]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const action = btn.dataset.action;
+        if (action === 'edit') return openForm(task);
+        if (action === 'history') return showRunHistory(task);
+
         if (action === 'delete') {
-          if (!confirm('Delete this task?')) return;
-          await api('DELETE', `/tasks/${taskId}`);
-          toast('Task deleted', 'success');
-        } else if (action === 'run') {
-          await api('POST', `/tasks/${taskId}/run`, {});
-          toast('Run accepted', 'success');
-        } else {
-          await api('POST', `/tasks/${taskId}/${action}`, {});
-          toast(`Task ${action} accepted`, 'success');
+          if (!confirm(`Delete "${task.title}"? Its run history is removed too.`)) return;
+          try {
+            await api('DELETE', `/tasks/${task.id}`);
+            toast('Task deleted', 'success');
+            navigate('tasks');
+          } catch (err) { toast(err.message, 'error'); }
+          return;
         }
-        navigate('tasks');
-      } catch (err) { toast(err.message, 'error'); }
+
+        btn.disabled = true;
+        try {
+          await api('POST', `/tasks/${task.id}/${action}`, {});
+          const messages = {
+            run: 'Run queued',
+            pause: 'Task paused',
+            resume: 'Task resumed',
+            cancel: 'Task cancelled',
+          };
+          toast(messages[action] || `Task ${action} done`, 'success');
+          navigate('tasks');
+        } catch (err) {
+          toast(err.message, 'error');
+          btn.disabled = false;
+        }
+      });
     });
   });
 };
 
-/// Show a task's execution history: when each run happened, its status, the
-/// result, and the recorded steps (tool calls with parameters and outputs).
-async function showRunHistory(taskId, task) {
-  const container = document.getElementById('task-form-container');
-  container.innerHTML = '<div class="card" style="margin:16px 0"><p class="muted">Loading history…</p></div>';
+/** Card markup for one task, with its human-readable schedule summary. */
+function taskCardHtml(task) {
+  const isRunning = task.last_run_status === 'running' || task.last_run_status === 'queued';
+  const canPause = task.status === 'active';
+  const canResume = task.status === 'paused';
+  return `
+    <div class="task-card" data-id="${esc(task.id)}">
+      <div class="task-card-head">
+        <div class="task-title">${esc(task.title)}</div>
+        <span class="spacer"></span>
+        <span class="badge ${esc(task.status)}">${esc(task.status)}</span>
+      </div>
+      <div class="task-objective">${esc(task.objective)}</div>
+      <div class="task-meta">
+        <span class="task-meta-item"><span class="dot"></span>${esc(taskScheduleLabel(task))}</span>
+        ${taskTimingHtml(task)}
+      </div>
+      <div class="task-actions">
+        <button class="btn btn-sm" data-action="run" ${isRunning ? 'disabled' : ''}>Run now</button>
+        ${canPause ? '<button class="btn btn-sm btn-secondary" data-action="pause">Pause</button>' : ''}
+        ${canResume ? '<button class="btn btn-sm btn-secondary" data-action="resume">Resume</button>' : ''}
+        <button class="btn btn-sm btn-secondary" data-action="history">History</button>
+        <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
+        <span class="spacer"></span>
+        <button class="btn-icon danger" data-action="delete" title="Delete task">✕</button>
+      </div>
+    </div>`;
+}
+
+/**
+ * Create/edit dialog. The schedule is chosen from presets or a friendly
+ * "every N" form; the generated cron stays an implementation detail.
+ */
+function showTaskForm(task, agents) {
+  const isEdit = Boolean(task);
+  const currentCron = task?.schedule_cron || '';
+  const presetMatch = SCHEDULE_PRESETS.find((p) => p.cron === currentCron);
+  const mode = !currentCron ? 'manual' : presetMatch ? presetMatch.label : 'custom';
+
+  const presetOptions = SCHEDULE_PRESETS.map((p) => `
+    <option value="${esc(p.cron)}" ${p.cron === currentCron ? 'selected' : ''}>
+      ${esc(p.label)} — ${esc(p.hint)}
+    </option>`).join('');
+
+  const modal = openModal({
+    title: isEdit ? 'Edit task' : 'New task',
+    bodyHtml: `
+      <div class="form-row">
+        <label class="field-label" for="task-title">Name</label>
+        <input id="task-title" placeholder="Morning inbox summary" value="${esc(task?.title || '')}">
+      </div>
+      <div class="form-row">
+        <label class="field-label" for="task-objective">What should the agent do?</label>
+        <textarea id="task-objective" placeholder="Summarize unread email and post the highlights to the team channel.">${esc(task?.objective || '')}</textarea>
+      </div>
+      <div class="form-row">
+        <label class="field-label" for="task-agent">Agent</label>
+        <select id="task-agent">
+          ${agents.map((a) => `<option value="${esc(a.id)}" ${task?.agent_id === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label class="field-label" for="task-schedule">When should it run?</label>
+        <select id="task-schedule">
+          <option value="" ${mode === 'manual' ? 'selected' : ''}>Only when I ask</option>
+          ${presetOptions}
+          <option value="__custom" ${mode === 'custom' ? 'selected' : ''}>Custom schedule…</option>
+        </select>
+        <div class="field-hint" id="task-schedule-hint"></div>
+      </div>
+      <div class="form-row hidden" id="task-custom-row">
+        <label class="field-label" for="task-cron">Cron expression</label>
+        <input id="task-cron" placeholder="0 9 * * 1-5" value="${esc(currentCron)}">
+        <div class="field-hint">Five fields: minute hour day-of-month month day-of-week.</div>
+      </div>
+    `,
+    footerHtml: `
+      <button class="btn btn-secondary" data-close>Cancel</button>
+      <button class="btn" id="task-save">${isEdit ? 'Save changes' : 'Create task'}</button>
+    `,
+  });
+
+  const root = modal.root;
+  const scheduleSelect = root.querySelector('#task-schedule');
+  const hint = root.querySelector('#task-schedule-hint');
+  const customRow = root.querySelector('#task-custom-row');
+  const cronInput = root.querySelector('#task-cron');
+
+  const syncScheduleUi = () => {
+    const value = scheduleSelect.value;
+    customRow.classList.toggle('hidden', value !== '__custom');
+    if (value === '__custom') {
+      hint.textContent = cronInput.value.trim()
+        ? `Reads as: ${describeCron(cronInput.value.trim())}`
+        : 'Describe the schedule as a cron expression.';
+    } else if (!value) {
+      hint.textContent = 'This task runs only when you press Run now.';
+    } else {
+      const preset = SCHEDULE_PRESETS.find((p) => p.cron === value);
+      hint.textContent = preset ? `${preset.hint} (${describeCron(value)})` : '';
+    }
+  };
+  scheduleSelect.addEventListener('change', syncScheduleUi);
+  cronInput.addEventListener('input', syncScheduleUi);
+  syncScheduleUi();
+
+  root.querySelector('#task-save').addEventListener('click', async () => {
+    const title = root.querySelector('#task-title').value.trim();
+    const objective = root.querySelector('#task-objective').value.trim();
+    const agentId = root.querySelector('#task-agent').value;
+    const choice = scheduleSelect.value;
+    const cron = choice === '__custom' ? cronInput.value.trim() : choice;
+
+    if (!title || !objective) { toast('Name and objective are required', 'error'); return; }
+    if (!agentId) { toast('Create an agent in Chat first', 'error'); return; }
+    if (choice === '__custom' && !cron) { toast('Enter a cron expression or pick a preset', 'error'); return; }
+
+    const body = { title, objective, agent_id: agentId };
+    // `schedule: null` explicitly removes an existing schedule; omitting it
+    // would leave the old cron in place.
+    body.schedule = cron ? { cron } : null;
+
+    const saveBtn = root.querySelector('#task-save');
+    saveBtn.disabled = true;
+    try {
+      if (isEdit) {
+        await api('PATCH', `/tasks/${task.id}`, body);
+        toast('Task updated', 'success');
+      } else {
+        await api('POST', '/tasks', body);
+        toast('Task created', 'success');
+      }
+      modal.close();
+      navigate('tasks');
+    } catch (err) {
+      toast(err.message, 'error');
+      saveBtn.disabled = false;
+    }
+  });
+}
+
+/// Execution history: each run with its status, duration, result and steps.
+async function showRunHistory(task) {
+  const modal = openModal({
+    title: `History — ${task.title}`,
+    bodyHtml: '<div class="muted">Loading runs…</div>',
+  });
+  const body = modal.root.querySelector('.modal-body');
+
   try {
-    const { items: runs } = await api('GET', `/tasks/${taskId}/runs?limit=20`);
+    const { items: runs } = await api('GET', `/tasks/${task.id}/runs?limit=20`);
+    if (!runs.length) {
+      body.innerHTML = emptyState('This task has not run yet.', '⏱');
+      return;
+    }
+
     const rows = await Promise.all(runs.map(async (run) => {
       let stepsHtml = '<div class="muted" style="font-size:.85rem">No recorded steps</div>';
       try {
@@ -568,47 +1028,45 @@ async function showRunHistory(taskId, task) {
         if (steps.length) {
           stepsHtml = steps.map((s) => `
             <details class="run-step">
-              <summary>Step ${s.step_index} — <span class="badge ${esc(s.status)}">${esc(s.status)}</span></summary>
+              <summary>
+                <span>Step ${s.step_index}</span>
+                <span class="badge ${esc(s.status)}">${esc(s.status)}</span>
+              </summary>
               <div class="run-step-body">
-                <div><strong>Input:</strong></div>
+                <div><strong>Input</strong></div>
                 <pre>${esc(JSON.stringify(s.input, null, 2))}</pre>
-                ${s.output ? `<div><strong>Output:</strong></div><pre>${esc(JSON.stringify(s.output, null, 2))}</pre>` : ''}
+                ${s.output ? `<div><strong>Output</strong></div><pre>${esc(JSON.stringify(s.output, null, 2))}</pre>` : ''}
                 ${s.error_message ? `<div class="error">${esc(s.error_message)}</div>` : ''}
               </div>
             </details>`).join('');
         }
       } catch { /* steps unavailable */ }
+
+      const duration = formatDuration(run.started_at, run.finished_at);
       return `
         <details class="run-entry">
           <summary>
             <span class="badge ${esc(run.status)}">${esc(run.status)}</span>
-            <span class="muted" style="font-size:.85rem">
-              ${esc(run.trigger)} · started ${esc((run.started_at || '—').slice(0, 19).replace('T', ' '))}
-              ${run.finished_at ? `· finished ${esc(run.finished_at.slice(0, 19).replace('T', ' '))}` : ''}
+            <span class="muted" style="font-size:.83rem">
+              ${esc(run.trigger)} · ${esc(formatDateTime(run.started_at || run.created_at))}
             </span>
+            ${duration ? `<span class="run-time">${esc(duration)}</span>` : ''}
           </summary>
           <div class="run-step-body">
-            ${run.result ? `<div><strong>Result:</strong></div><pre>${esc(JSON.stringify(run.result, null, 2))}</pre>` : ''}
+            ${run.result ? `<div><strong>Result</strong></div><pre>${esc(JSON.stringify(run.result, null, 2))}</pre>` : ''}
             ${run.error_message ? `<div class="error">${esc(run.error_message)}</div>` : ''}
-            <div style="margin-top:8px"><strong>Steps:</strong></div>
+            <div style="margin:10px 0 6px"><strong>Steps</strong></div>
             ${stepsHtml}
           </div>
         </details>`;
     }));
-    container.innerHTML = `
-      <div class="card" style="margin:16px 0">
-        <div style="display:flex; align-items:center; gap:10px">
-          <h3>Execution history — ${esc(task?.title || '')}</h3>
-          <span class="spacer"></span>
-          <button class="btn btn-sm btn-secondary" id="history-close">Close</button>
-        </div>
-        ${runs.length ? rows.join('') : '<div class="empty-state">This task has not run yet.</div>'}
-      </div>`;
-    document.getElementById('history-close').addEventListener('click', () => { container.innerHTML = ''; });
+
+    body.innerHTML = rows.join('');
   } catch (err) {
-    container.innerHTML = `<div class="card" style="margin:16px 0"><p class="error">Failed to load history: ${esc(err.message)}</p></div>`;
+    body.innerHTML = `<p class="error">Failed to load history: ${esc(err.message)}</p>`;
   }
 }
+
 
 // ---------------------------------------------------------------------------
 // Skills
@@ -623,37 +1081,41 @@ views.skills = async (content) => {
   const availableBuiltins = catalog.items.filter((b) => !installedIds.has(b.id));
 
   content.innerHTML = `
-    <h2 class="section-title">Skills</h2>
+    ${pageHead('Skills', 'Capabilities the agent can use. Install built-in packages or upload your own.')}
     ${availableBuiltins.length ? `
-      <h3 class="section-title" style="font-size:1rem">Available built-in skills</h3>
-      <div class="grid" style="margin-bottom:20px">${availableBuiltins.map((b) => `
-        <div class="card" data-builtin="${esc(b.id)}">
-          <h3>${esc(b.id.replace('-skill', '').replace(/(^|\\b)(\\w)/g, (m) => m.toUpperCase()))}</h3>
-          <p class="muted" style="margin-bottom:10px; font-size:.9rem">${esc(b.description)}</p>
+      <h3 class="section-title">Available built-in skills</h3>
+      <div class="grid" style="margin-bottom:24px">${availableBuiltins.map((b) => `
+        <div class="card interactive" data-builtin="${esc(b.id)}">
+          <h3>${esc(b.id.replace('-skill', '').replace(/(^|\b)(\w)/g, (m) => m.toUpperCase()))}</h3>
+          <p class="muted" style="margin-bottom:14px; font-size:.87rem">${esc(b.description)}</p>
           <button class="btn btn-sm" data-install="${esc(b.id)}">Install</button>
         </div>`).join('')}</div>` : ''}
-    <div class="card" style="margin-bottom:16px">
+    <div class="card" style="margin-bottom:24px">
       <h3>Install a custom skill package</h3>
-      <p class="muted" style="margin-bottom:12px">Upload a skill ZIP. It is validated before installation.</p>
+      <p class="muted" style="margin:6px 0 14px; font-size:.87rem">Upload a skill ZIP. It is validated before installation.</p>
       <label class="file-drop" id="skill-drop" for="skill-file">
         <input type="file" id="skill-file" accept=".zip" hidden>
         <span id="skill-drop-text">📁 Choose a .zip file or drop it here</span>
       </label>
-      <button class="btn hidden" id="skill-upload" style="margin-top:12px">Upload and install</button>
+      <button class="btn hidden" id="skill-upload" style="margin-top:14px">Upload and install</button>
     </div>
+    <h3 class="section-title">Installed skills</h3>
     ${installed.items.length ? `<div class="grid">${installed.items.map((s) => `
       <div class="card" data-id="${esc(s.id)}">
-        <h3>${esc(s.name)}</h3>
-        <p class="muted" style="margin-bottom:8px">${esc(s.id)}</p>
-        <span class="badge ${esc(s.status)}">${esc(s.status)}</span>
-        <div style="margin-top:12px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <h3 style="margin:0">${esc(s.name)}</h3>
+          <span class="spacer"></span>
+          <span class="badge ${esc(s.status)}">${esc(s.status)}</span>
+        </div>
+        <p class="muted" style="margin-bottom:14px; font-size:.82rem">${esc(s.id)}</p>
+        <div class="task-actions">
           <button class="btn btn-sm btn-secondary" data-action="enable">Enable</button>
           <button class="btn btn-sm btn-secondary" data-action="disable">Disable</button>
-          <button class="btn btn-sm btn-danger" data-action="uninstall">Uninstall</button>
           <button class="btn btn-sm btn-secondary" data-action="versions">Versions</button>
+          <button class="btn btn-sm btn-danger" data-action="uninstall">Uninstall</button>
         </div>
-        <div class="skill-versions" style="margin-top:8px"></div>
-      </div>`).join('')}</div>` : '<div class="empty-state">No skills installed yet.</div>'}
+        <div class="skill-versions" style="margin-top:10px"></div>
+      </div>`).join('')}</div>` : emptyState('No skills installed yet.', '◆')}
   `;
 
   // One-click builtin installation.
@@ -803,18 +1265,21 @@ views.integrations = async (content) => {
     api('GET', '/integrations'),
   ]);
   content.innerHTML = `
-    <h2 class="section-title">Integrations</h2>
-    <div class="card" style="margin-bottom:16px">
+    ${pageHead('Integrations', 'Accounts the agent can act on: mail, calendars, repositories and more.')}
+    <div class="card" style="margin-bottom:20px">
       <h3>Connect a provider</h3>
-      <div class="form-row" style="margin-top:10px; max-width:420px">
+      <div class="form-row" style="margin-top:14px; max-width:440px">
+        <label class="field-label" for="integration-type">Provider</label>
         <select id="integration-type">
           ${catalog.items.map((c) => `<option value="${esc(c.provider_type)}">${esc(c.provider_type)}</option>`).join('')}
         </select>
-        <input id="integration-name" placeholder="Display name">
-        <input id="integration-token" type="password" placeholder="Access token (for manual connection; leave empty to use OAuth when available)">
+        <label class="field-label" for="integration-name">Display name</label>
+        <input id="integration-name" placeholder="Work Gmail">
+        <label class="field-label" for="integration-token">Access token (optional)</label>
+        <input id="integration-token" type="password" placeholder="Leave empty to use OAuth when available">
         <button class="btn" id="integration-connect">Connect</button>
+        <p class="field-hint">Google providers use OAuth when GOOGLE_CLIENT_ID is configured; otherwise connect manually with an access token.</p>
       </div>
-      <p class="muted" style="font-size:.85rem; margin-top:8px">Google providers use OAuth when GOOGLE_CLIENT_ID is configured; otherwise connect manually with an access token.</p>
     </div>
     ${connections.items.length ? `<table class="table">
       <thead><tr><th>Provider</th><th>Name</th><th>Status</th><th></th></tr></thead>
@@ -822,9 +1287,9 @@ views.integrations = async (content) => {
         <tr data-id="${esc(i.id)}">
           <td>${esc(i.provider_type)}</td><td>${esc(i.display_name)}</td>
           <td><span class="badge ${esc(i.status)}">${esc(i.status)}</span></td>
-          <td><button class="btn btn-sm btn-danger" data-action="disconnect">Disconnect</button></td>
+          <td style="text-align:right"><button class="btn btn-sm btn-danger" data-action="disconnect">Disconnect</button></td>
         </tr>`).join('')}
-      </tbody></table>` : '<div class="empty-state">No integrations connected.</div>'}
+      </tbody></table>` : emptyState('No integrations connected.', '⇄')}
   `;
   document.getElementById('integration-connect').addEventListener('click', async () => {
     const providerType = document.getElementById('integration-type').value;
@@ -863,20 +1328,22 @@ views.integrations = async (content) => {
 views.approvals = async (content) => {
   const { items } = await api('GET', '/approvals?status=pending&limit=100');
   content.innerHTML = `
-    <h2 class="section-title">Approval inbox</h2>
+    ${pageHead('Approvals', 'Operations the agent wants to perform. Approve or reject each one.',
+      items.length ? `<span class="badge pending">${items.length} waiting</span>` : '')}
     ${items.length ? items.map((a) => `
       <div class="card" style="margin-bottom:12px" data-id="${esc(a.id)}">
-        <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap">
           <span class="badge ${esc(a.status)}">${esc(a.status)}</span>
-          ${a.tool_name ? `<code>${esc(a.tool_name)}</code>` : ''}
-          <span class="muted">expires ${esc(a.expires_at)}</span>
+          ${a.tool_name ? `<code class="mono" style="font-size:.83rem">${esc(a.tool_name)}</code>` : ''}
+          <span class="spacer"></span>
+          <span class="muted" style="font-size:.8rem">expires ${esc(relativeTime(a.expires_at))}</span>
         </div>
-        ${a.args ? `<pre class="tool-trace-params" style="margin:0 0 10px">${esc(JSON.stringify(a.args, null, 2))}</pre>` : ''}
-        <div class="form-row" style="flex-direction:row; gap:8px">
+        ${a.args ? `<pre class="tool-trace-params" style="margin:0 0 14px">${esc(JSON.stringify(a.args, null, 2))}</pre>` : ''}
+        <div style="display:flex; gap:8px">
           <button class="btn" data-action="approve">Approve</button>
           <button class="btn btn-danger" data-action="reject">Reject</button>
         </div>
-      </div>`).join('') : '<div class="empty-state">No pending approvals.</div>'}
+      </div>`).join('') : emptyState('Nothing to approve right now.', '✓')}
   `;
   content.querySelectorAll('.card[data-id] button').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -916,8 +1383,10 @@ views.settings = async (content) => {
   }));
 
   content.innerHTML = `
-    <h2 class="section-title">Agents</h2>
-    <p class="muted" style="margin-bottom:12px; font-size:.9rem">Agents are managed by the system: the assistant routes your requests automatically. You only need to touch them here to change instructions or remove one.</p>
+    ${pageHead('Settings', 'Agents, execution policy, model providers and tool servers.')}
+
+    <h3 class="section-title" style="margin-top:0">Agents</h3>
+    <p class="muted" style="margin-bottom:14px; font-size:.87rem">Agents are managed by the system: the assistant routes your requests automatically. You only need to touch them here to change instructions or remove one.</p>
     ${agents.items.map((a) => `
       <div class="card" style="margin-bottom:10px" data-agent="${esc(a.id)}">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
@@ -927,11 +1396,11 @@ views.settings = async (content) => {
           <button class="btn btn-sm btn-secondary" data-action="edit-agent">Edit instructions</button>
           <button class="btn btn-sm btn-danger" data-action="delete-agent">Remove</button>
         </div>
-        <div class="muted" style="font-size:.85rem; margin-top:6px; white-space:pre-wrap">${esc(a.instructions || 'No instructions')}</div>
+        <div class="muted" style="font-size:.85rem; margin-top:8px; white-space:pre-wrap">${esc(a.instructions || 'No instructions')}</div>
       </div>`).join('')}
 
-    <h2 class="section-title">Executions</h2>
-    <div class="card" style="margin-bottom:16px">
+    <h3 class="section-title">Executions</h3>
+    <div class="card" style="margin-bottom:20px">
       <label style="display:flex; align-items:center; gap:10px; cursor:pointer">
         <input type="checkbox" id="auto-approve-global" ${autoApprove.enabled ? 'checked' : ''}>
         <span>Run all tool executions without asking for approval</span>
@@ -939,9 +1408,9 @@ views.settings = async (content) => {
       <p class="muted" style="margin:8px 0 0; font-size:.85rem">When enabled, the agent executes tools immediately. Critical-risk operations still always ask. You can also override this per chat in the chat toolbar.</p>
     </div>
 
-    <h2 class="section-title">LLM providers</h2>
+    <h3 class="section-title">LLM providers</h3>
     <div class="card" style="margin-bottom:16px">
-      <div class="form-row" style="max-width:420px">
+      <div class="form-row" style="max-width:440px">
         <input id="provider-name" placeholder="Name">
         <select id="provider-type">
           <option value="openai_compatible">OpenAI-compatible</option>
@@ -973,9 +1442,9 @@ views.settings = async (content) => {
           </div>
         </div>
       </div>`).join('') : '<p class="muted">No providers configured. The app works without one, but the agent needs an LLM to plan tasks.</p>'}
-    <h2 class="section-title">MCP servers</h2>
+    <h3 class="section-title">MCP servers</h3>
     <div class="card" style="margin-bottom:16px">
-      <div class="form-row" style="max-width:520px">
+      <div class="form-row" style="max-width:540px">
         <input id="mcp-name" placeholder="Server name">
         <input id="mcp-url" placeholder="MCP endpoint URL (https://…/mcp)">
         <input id="mcp-auth" type="password" placeholder="Authorization header value (optional)">
@@ -983,8 +1452,8 @@ views.settings = async (content) => {
       </div>
     </div>
     <div id="mcp-list"></div>
-    <h2 class="section-title">Workspace</h2>
-    <div class="card"><pre style="font-size:.85rem">${esc(JSON.stringify(workspaceConfig, null, 2))}</pre></div>
+    <h3 class="section-title">Workspace</h3>
+    <div class="card"><pre class="mono" style="font-size:.8rem;white-space:pre-wrap">${esc(JSON.stringify(workspaceConfig, null, 2))}</pre></div>
   `;
 
   // Render MCP servers with their tools.
@@ -1143,8 +1612,7 @@ function updateChatSidebar(title) {
     list.prepend(current);
   }
   if (title) current.querySelector('.chat-list-title').textContent = title;
-  const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
-  current.querySelector('.chat-list-meta').textContent = now;
+  current.querySelector('.chat-list-meta').textContent = 'just now';
   list.querySelectorAll('.chat-list-item').forEach((i) =>
     i.classList.toggle('selected', i.dataset.conv === currentConversationId));
 }

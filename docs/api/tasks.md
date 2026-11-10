@@ -24,6 +24,23 @@ Tasks are persistent, schedulable units of work. A task run is one execution of 
 
 Filters support status, agent, creation time, and schedule state.
 
+### Task representation
+
+List and detail responses describe the schedule without exposing cron syntax
+as the user-facing label:
+
+| Field | Meaning |
+|---|---|
+| `schedule` | Raw schedule object, e.g. `{ "cron": "0 9 * * 1-5" }`, or `null` |
+| `schedule_cron` | The cron expression alone, for clients that render their own description |
+| `next_run_at` | Next fire time (RFC 3339) while the schedule is active |
+| `last_run_status` | Status of the most recent run, or `null` |
+| `last_run_at` | Creation time of the most recent run, or `null` |
+
+`PATCH /tasks/{id}` treats `schedule` as follows: omitted leaves the schedule
+unchanged, `null` removes the schedule and returns the task to on-demand
+(`draft`), and an object replaces it and reactivates the task.
+
 ## Task runs
 
 | Method | Endpoint | Purpose |

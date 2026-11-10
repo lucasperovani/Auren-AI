@@ -118,6 +118,21 @@ async fn ticket_issued_for_valid_session() {
     assert!(!body["ticket"].as_str().unwrap().is_empty());
 }
 
+/// Block until the server-side socket handler has subscribed to the event
+/// bus. The upgrade handler subscribes inside the spawned connection task,
+/// which runs after the client handshake completes: publishing right after
+/// `connect_async` otherwise races and the event is silently dropped.
+async fn wait_for_subscriber(state: &AppState) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.events.subscriber_count() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server never subscribed the websocket client to the event bus"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Full flow: issue ticket, connect over a real WebSocket, receive a
 /// published event end-to-end.
 #[tokio::test]
@@ -159,18 +174,28 @@ async fn websocket_receives_published_events() {
     .await
     .unwrap();
 
+    // The upgrade completes before the handler subscribes: wait for it.
+    wait_for_subscriber(&state).await;
+
     // Publish an event and expect it on the socket.
     crate::api::events::publish(
         &state,
         "task.started",
         json!({ "task_id": "t-1", "task_run_id": "r-1" }),
     );
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
-        .await
-        .expect("timed out waiting for event")
-        .unwrap()
-        .unwrap();
-    let envelope: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+
+    // Only text frames carry events; ping/pong keepalives are transparent.
+    let envelope: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let msg = ws.next().await.expect("socket closed").expect("socket error");
+            if msg.is_text() {
+                return serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for event");
+
     assert_eq!(envelope["event_type"], "task.started");
     assert_eq!(envelope["data"]["task_id"], "t-1");
     assert!(envelope["event_id"].is_string());

@@ -66,6 +66,13 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.tx.subscribe()
     }
+
+    /// Number of live subscribers. A broadcast channel only delivers to
+    /// receivers that already exist, so producers that must not drop an
+    /// event (and tests) need a way to observe attachment.
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
 }
 
 /// A single-use WebSocket ticket. The client obtains it over an

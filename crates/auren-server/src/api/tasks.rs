@@ -47,13 +47,38 @@ pub struct TaskResponse {
     pub objective: String,
     pub status: String,
     pub schedule: Option<serde_json::Value>,
+    /// Raw cron expression when the task is scheduled. Clients render a
+    /// human description; the expression itself is never shown to users.
+    pub schedule_cron: Option<String>,
+    /// Next scheduled fire time (RFC 3339), when a schedule is active.
+    pub next_run_at: Option<String>,
+    /// Status and finish time of the most recent run, for list summaries.
+    pub last_run_status: Option<String>,
+    pub last_run_at: Option<String>,
     pub timezone: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
+/// Task columns plus the joined schedule and latest run, so list and detail
+/// endpoints agree on the shape consumed by `row_to_task`.
+const TASK_SELECT: &str = "SELECT t.*, j.next_run_at AS next_run_at, \
+     r.status AS last_run_status, r.created_at AS last_run_at \
+     FROM tasks t \
+     LEFT JOIN scheduled_jobs j ON j.task_id = t.id AND j.status = 'active' \
+     LEFT JOIN task_runs r ON r.id = (\
+         SELECT id FROM task_runs WHERE task_id = t.id ORDER BY created_at DESC LIMIT 1\
+     )";
+
 fn row_to_task(r: &sqlx::sqlite::SqliteRow) -> TaskResponse {
     let schedule_json: Option<String> = r.get("schedule_json");
+    let schedule: Option<serde_json::Value> =
+        schedule_json.and_then(|s| serde_json::from_str(&s).ok());
+    let schedule_cron = schedule
+        .as_ref()
+        .and_then(|s| s.get("cron"))
+        .and_then(|c| c.as_str())
+        .map(|c| c.to_string());
     TaskResponse {
         id: r.get("id"),
         agent_id: r.get("agent_id"),
@@ -61,7 +86,11 @@ fn row_to_task(r: &sqlx::sqlite::SqliteRow) -> TaskResponse {
         title: r.get("title"),
         objective: r.get("objective"),
         status: r.get("status"),
-        schedule: schedule_json.and_then(|s| serde_json::from_str(&s).ok()),
+        schedule,
+        schedule_cron,
+        next_run_at: r.try_get("next_run_at").ok().flatten(),
+        last_run_status: r.try_get("last_run_status").ok().flatten(),
+        last_run_at: r.try_get("last_run_at").ok().flatten(),
         timezone: r.get("timezone"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
@@ -76,14 +105,14 @@ pub async fn list_tasks(
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let cursor = params.cursor.as_deref().and_then(pagination::decode_cursor);
 
-    let mut sql = String::from("SELECT * FROM tasks WHERE user_id = ?");
+    let mut sql = format!("{TASK_SELECT} WHERE t.user_id = ?");
     if params.status.is_some() {
-        sql.push_str(" AND status = ?");
+        sql.push_str(" AND t.status = ?");
     }
     if params.agent_id.is_some() {
-        sql.push_str(" AND agent_id = ?");
+        sql.push_str(" AND t.agent_id = ?");
     }
-    sql.push_str(" AND id > ? ORDER BY id LIMIT ?");
+    sql.push_str(" AND t.id > ? ORDER BY t.id LIMIT ?");
 
     let mut query = sqlx::query(&sql).bind(&user.id);
     if let Some(s) = &params.status {
@@ -139,7 +168,10 @@ pub async fn create_task(
             req.conversation_id.as_deref(),
         )
         .await?;
-    let row = sqlx::query("SELECT * FROM tasks WHERE id = ?").bind(&id).fetch_one(&state.db).await?;
+    let row = sqlx::query(&format!("{TASK_SELECT} WHERE t.id = ?"))
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await?;
     Ok((axum::http::StatusCode::CREATED, Json(row_to_task(&row))))
 }
 
@@ -149,7 +181,10 @@ pub async fn get_task(
     Path(task_id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
     TaskService::new(&state).require_owned(&user.id, &task_id).await?;
-    let row = sqlx::query("SELECT * FROM tasks WHERE id = ?").bind(&task_id).fetch_one(&state.db).await?;
+    let row = sqlx::query(&format!("{TASK_SELECT} WHERE t.id = ?"))
+        .bind(&task_id)
+        .fetch_one(&state.db)
+        .await?;
     Ok(Json(row_to_task(&row)))
 }
 
@@ -157,7 +192,19 @@ pub async fn get_task(
 pub struct UpdateTaskRequest {
     pub title: Option<String>,
     pub objective: Option<String>,
-    pub schedule: Option<serde_json::Value>,
+    /// `None` = field absent (leave unchanged); `Some(None)` = explicit null
+    /// (remove the schedule); `Some(Some(v))` = replace the schedule.
+    #[serde(default, deserialize_with = "double_option")]
+    pub schedule: Option<Option<serde_json::Value>>,
+}
+
+/// Distinguish a missing field from an explicit `null`. Plain `Option`
+/// collapses both cases, which would make "remove the schedule" impossible.
+fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<serde_json::Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(deserializer).map(Some)
 }
 
 pub async fn update_task(
@@ -167,9 +214,25 @@ pub async fn update_task(
     Json(req): Json<UpdateTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
     let svc = TaskService::new(&state);
-    svc.update(&user.id, &task_id, req.title.as_deref(), req.objective.as_deref(), req.schedule.as_ref())
+    match req.schedule {
+        Some(Some(schedule)) => {
+            svc.update(&user.id, &task_id, req.title.as_deref(), req.objective.as_deref(), Some(&schedule))
+                .await?;
+        }
+        Some(None) => {
+            svc.clear_schedule(&user.id, &task_id).await?;
+            svc.update(&user.id, &task_id, req.title.as_deref(), req.objective.as_deref(), None)
+                .await?;
+        }
+        None => {
+            svc.update(&user.id, &task_id, req.title.as_deref(), req.objective.as_deref(), None)
+                .await?;
+        }
+    }
+    let row = sqlx::query(&format!("{TASK_SELECT} WHERE t.id = ?"))
+        .bind(&task_id)
+        .fetch_one(&state.db)
         .await?;
-    let row = sqlx::query("SELECT * FROM tasks WHERE id = ?").bind(&task_id).fetch_one(&state.db).await?;
     Ok(Json(row_to_task(&row)))
 }
 

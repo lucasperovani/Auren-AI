@@ -191,6 +191,35 @@ impl TaskService {
         Ok(())
     }
 
+    /// Remove a task's schedule and drop back to on-demand runs. Deletes the
+    /// persistent job so the scheduler stops picking the task up.
+    pub async fn clear_schedule(&self, user_id: &str, task_id: &str) -> Result<(), ApiError> {
+        let status = self.require_owned(user_id, task_id).await?;
+        if status == "completed" || status == "cancelled" {
+            return Err(ApiError::Conflict("task is closed".into()));
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = self.db.begin().await.map_err(ApiError::from)?;
+        sqlx::query("DELETE FROM scheduled_jobs WHERE task_id = ?")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        // A task without a schedule is on-demand, never `active`.
+        sqlx::query("UPDATE tasks SET schedule_json = NULL, status = 'draft', updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await.map_err(ApiError::from)?;
+
+        self.events.publish(EventEnvelope::new(
+            "task.updated",
+            json!({ "task_id": task_id }),
+        ));
+        Ok(())
+    }
+
     /// Transition task status with validation, emitting the matching event.
     pub async fn set_status(
         &self,
