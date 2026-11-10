@@ -18,9 +18,14 @@ stages:
 variables:
   TARGET: aarch64-unknown-linux-musl
   IMAGE_TAG: latest
-  # Buildah keeps its store in $HOME by default. Pointing it at the project
-  # directory lets GitLab's cache preserve images and layer cache between jobs.
-  BUILDAH_STORE: "$CI_PROJECT_DIR/.buildah"
+  # Buildah keeps its store in $HOME by default. Moving it inside the project
+  # directory lets GitLab's cache carry images and layer cache between jobs.
+  #
+  # These are `buildah --root` / `--runroot` values, not storage.conf options:
+  # passing `graphroot` through STORAGE_OPTS fails with
+  # `unknown option "graphroot"`.
+  BUILDAH_ROOT: "$CI_PROJECT_DIR/.buildah/storage"
+  BUILDAH_RUNROOT: "$CI_PROJECT_DIR/.buildah/runroot"
 
 # Persist buildah's store between jobs. The key follows the two files that
 # actually change the dependency graph, so an unrelated commit reuses the cache
@@ -47,14 +52,11 @@ build-arm64:
     BUILDAH_ISOLATION: chroot
   before_script:
     - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    # Redirect the container store into the cached directory. Exported here
-    # rather than in `variables:` because it needs shell expansion.
-    - export STORAGE_OPTS="graphroot=$BUILDAH_STORE/storage runroot=$BUILDAH_STORE/runroot"
     # NOTE: every item is quoted. An unquoted `echo "text: more"`
     # contains ": " which YAML reads as a key/value separator, turning the
     # item into a mapping — and GitLab then rejects before_script with
-    # "should be a string or a nested array of strings".
-    - if [ -d "$BUILDAH_STORE" ]; then du -sh "$BUILDAH_STORE"; else echo "cache cold, building from scratch"; fi
+    # "should be a array of strings".
+    - if [ -d "$BUILDAH_ROOT" ]; then du -sh "$BUILDAH_ROOT"; else echo "cache cold, building from scratch"; fi
   script:
     # NOTE on caching flags: buildah rejects a tag in `--cache-from` and
     # `--cache-to` ("repository must contain neither a tag nor digest"),
@@ -64,12 +66,17 @@ build-arm64:
     # `cache:` block above): the Dockerfile is written so a code-only change
     # reuses the dependency layer, which is where nearly all the time goes.
     - >
-      buildah build
+      buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT"
+      build
       --layers
       --build-arg TARGET=$TARGET
       -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
       -f Dockerfile .
-    - buildah push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+    # The same store flags are required here: push reads the image from the
+    # storage root, and without them it would look in $HOME and find nothing.
+    - >
+      buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT"
+      push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
