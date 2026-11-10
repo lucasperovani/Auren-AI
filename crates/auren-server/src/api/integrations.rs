@@ -27,6 +27,7 @@ pub fn router() -> Router<AppState> {
         .route("/{integration_id}/accounts/{account_id}/test", post(test_account))
         .route("/{integration_id}/accounts/{account_id}/reconnect", post(reconnect_account))
         .route("/{integration_id}/accounts/{account_id}/capabilities", get(account_capabilities))
+        .route("/{integration_id}/accounts/{account_id}/rate-limits", get(account_rate_limits))
 }
 
 /// Available integration provider types (spec 3.9: the capability list must
@@ -35,7 +36,7 @@ const CATALOG: &[(&str, &[&str])] = &[
     ("gmail", &["search_messages", "read_message", "create_draft", "send_message"]),
     ("gcal", &["list_events", "search_events", "create_event", "update_event", "cancel_event"]),
     ("gphotos", &["list_albums", "search_media", "get_media"]),
-    ("instagram", &["get_account_info", "list_media", "publish_media"]),
+    ("instagram", &["get_account_info", "list_media", "publish_media", "get_publishing_limit"]),
     ("flights", &["search_itineraries", "get_price", "monitor_price", "prepare_booking", "complete_purchase"]),
     ("github", &["list_files", "read_file", "write_file", "list_issues", "create_issue", "create_pr", "me", "list_repos", "search_repos", "list_prs", "get_pr", "merge_pr", "git_clone", "git_pull", "git_fetch", "git_push"]),
 ];
@@ -239,6 +240,16 @@ pub async fn delete_integration(
     Path(integration_id): Path<String>,
 ) -> ApiResult<axum::http::StatusCode> {
     require_owned_integration(&state, &user, &integration_id).await?;
+    // Queued work for a revoked account would keep retrying against a dead
+    // token, so drop it before the cascade deletes the accounts.
+    let accounts = sqlx::query("SELECT id FROM integration_accounts WHERE integration_id = ?")
+        .bind(&integration_id)
+        .fetch_all(&state.db)
+        .await?;
+    for account in accounts {
+        let account_id: String = account.get("id");
+        let _ = crate::services::rate_limits::cancel_for_account(&state, &account_id).await;
+    }
     sqlx::query("DELETE FROM integrations WHERE id = ?")
         .bind(&integration_id)
         .execute(&state.db)
@@ -335,6 +346,43 @@ pub async fn reconnect_account(
         .execute(&state.db)
         .await?;
     Ok(Json(json!({ "status": "active" })))
+}
+
+/// Remaining provider quota for an account, so the UI can show how much room
+/// is left before a metered operation is deferred.
+pub async fn account_rate_limits(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((integration_id, account_id)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_owned_account(&state, &user, &integration_id, &account_id).await?;
+    let limits = crate::services::rate_limits::account_usage(&state, &account_id).await?;
+
+    // Deferred work waiting on these limits, so the UI can explain the queue.
+    let rows = sqlx::query(
+        "SELECT id, operation, bucket, available_at, attempt_count, last_error
+         FROM deferred_operations
+         WHERE integration_account_id = ? AND status = 'pending'
+         ORDER BY available_at",
+    )
+    .bind(&account_id)
+    .fetch_all(&state.db)
+    .await?;
+    let deferred: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<String, _>("id"),
+                "operation": r.get::<String, _>("operation"),
+                "bucket": r.get::<String, _>("bucket"),
+                "available_at": r.get::<String, _>("available_at"),
+                "attempt_count": r.get::<i64, _>("attempt_count"),
+                "last_error": r.get::<Option<String>, _>("last_error"),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "limits": limits, "deferred": deferred })))
 }
 
 pub async fn account_capabilities(

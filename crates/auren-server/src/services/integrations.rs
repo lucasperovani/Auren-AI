@@ -40,6 +40,7 @@ pub async fn execute_integration_tool(
         ("instagram", "get_account_info") => instagram_account(&token, args).await,
         ("instagram", "list_media") => instagram_media(&token, args).await,
         ("instagram", "publish_media") => instagram_publish(&token, args).await,
+        ("instagram", "get_publishing_limit") => instagram_publishing_limit(&token, args).await,
         ("flights", "search_itineraries") => flights_search(state, args).await,
         ("flights", "get_price") => flights_price(state, args).await,
         ("flights", "monitor_price") => flights_monitor(args).await,
@@ -283,22 +284,131 @@ async fn instagram_media(token: &str, _args: &Value) -> Result<Value, ApiError> 
     Ok(json!({ "media": media.get("data").cloned().unwrap_or(json!([])) }))
 }
 
-/// Publishing goes through the approval engine by default (the tool is
-/// declared with risk_class "high" in the skill manifest).
+/// Remaining publishing quota reported by Instagram itself, when available.
+/// The platform exposes `content_publishing_limit`, which is authoritative;
+/// local accounting is only a guard against exceeding it.
+async fn instagram_publishing_quota(token: &str) -> Option<(i64, i64)> {
+    let url = format!(
+        "{INSTAGRAM_GRAPH}/me/content_publishing_limit?fields=config,quota_usage"
+    );
+    let value = meta_api(token, reqwest::Method::GET, url, None).await.ok()?;
+    let entry = value.get("data").and_then(|d| d.as_array()).and_then(|a| a.first())?;
+    let used = entry.get("quota_usage").and_then(|v| v.as_i64())?;
+    let total = entry
+        .get("config")
+        .and_then(|c| c.get("quota_total"))
+        .and_then(|v| v.as_i64())?;
+    Some((used, total))
+}
+
+/// Create a media container, wait for it to be ready, and publish it.
+///
+/// Publishing is a two-step flow on the Graph API: `POST /{ig-id}/media`
+/// creates a container, then `POST /{ig-id}/media_publish` publishes it. The
+/// container must reach `FINISHED` first; videos in particular need time to
+/// process, so the status is polled with a bounded, exponentially backed-off
+/// wait (never a hot loop).
 async fn instagram_publish(token: &str, args: &Value) -> Result<Value, ApiError> {
-    let image_url = args.get("image_url").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("image_url is required".into()))?;
+    let image_url = args
+        .get("image_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::Unprocessable("image_url is required".into()))?;
     let caption = args.get("caption").and_then(|v| v.as_str()).unwrap_or("");
-    // Step 1: create the media container.
-    let container = meta_api(token, reqwest::Method::POST, format!("{INSTAGRAM_GRAPH}/me/media"), Some(json!({
-        "image_url": image_url,
-        "caption": caption,
-    }))).await?;
-    let container_id = container.get("id").and_then(|v| v.as_str()).ok_or_else(|| ApiError::Unprocessable("container creation failed".into()))?;
-    // Step 2: publish the container.
-    let published = meta_api(token, reqwest::Method::POST, format!("{INSTAGRAM_GRAPH}/me/media"), Some(json!({
-        "creation_id": container_id,
-    }))).await?;
-    Ok(json!({ "media_id": published.get("id"), "published": true }))
+    // Self-disclosure of AI-generated media: Instagram expects this on the
+    // container so the post carries the AI label.
+    let is_ai_generated = args
+        .get("is_ai_generated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Step 1: create the container.
+    let mut body = json!({ "image_url": image_url, "caption": caption });
+    if is_ai_generated {
+        body["is_ai_generated"] = json!(true);
+    }
+    let container = meta_api(
+        token,
+        reqwest::Method::POST,
+        format!("{INSTAGRAM_GRAPH}/me/media"),
+        Some(body),
+    )
+    .await?;
+    let container_id = container
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::ServiceUnavailable)?;
+
+    // Step 2: wait for the container to finish processing.
+    wait_for_container(token, container_id).await?;
+
+    // Step 3: publish the container. This is the metered endpoint: Instagram
+    // enforces its post quota here, so a 429 must not be treated as failure.
+    let published = meta_api(
+        token,
+        reqwest::Method::POST,
+        format!("{INSTAGRAM_GRAPH}/me/media_publish"),
+        Some(json!({ "creation_id": container_id })),
+    )
+    .await?;
+
+    Ok(json!({
+        "media_id": published.get("id"),
+        "container_id": container_id,
+        "published": true,
+        "is_ai_generated": is_ai_generated,
+        // Partial successes must be reported, never smoothed over.
+        "config_issue": published.get("config_issue"),
+    }))
+}
+
+/// Wait until a media container is `FINISHED`. Polling is bounded (about five
+/// attempts) with exponential delays, matching Meta's guidance, and never
+/// blocks the request for long.
+async fn wait_for_container(token: &str, container_id: &str) -> Result<(), ApiError> {
+    let url = format!("{INSTAGRAM_GRAPH}/{container_id}?fields=status_code,status");
+    let mut delay = std::time::Duration::from_secs(2);
+
+    for _ in 0..5 {
+        let status = meta_api(token, reqwest::Method::GET, url.clone(), None).await?;
+        match status.get("status_code").and_then(|v| v.as_str()) {
+            Some("FINISHED") | Some("PUBLISHED") => return Ok(()),
+            Some("ERROR") => {
+                let detail = status
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("container processing failed");
+                return Err(ApiError::Unprocessable(format!(
+                    "Instagram rejected the media container: {detail}"
+                )));
+            }
+            Some("EXPIRED") => {
+                return Err(ApiError::Unprocessable(
+                    "Instagram media container expired before publishing".into(),
+                ));
+            }
+            // IN_PROGRESS: the media is still being processed.
+            _ => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+
+    Err(ApiError::ServiceUnavailable)
+}
+
+/// Report the account's publishing quota, so the UI can show how much room is
+/// left before the daily cap.
+async fn instagram_publishing_limit(token: &str, _args: &Value) -> Result<Value, ApiError> {
+    match instagram_publishing_quota(token).await {
+        Some((used, total)) => Ok(json!({
+            "used": used,
+            "limit": total,
+            "remaining": (total - used).max(0),
+        })),
+        // The endpoint is optional per login type; absence is not an error.
+        None => Ok(json!({ "used": null, "limit": null, "remaining": null })),
+    }
 }
 
 // ---------------------------------------------------------------------------

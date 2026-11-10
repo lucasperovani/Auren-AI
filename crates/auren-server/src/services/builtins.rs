@@ -624,18 +624,88 @@ async fn exec_ssh(state: &AppState, args: &Value) -> Result<Value, ApiError> {
 
 /// Send a message to the user in the frontend: persists a notification and
 /// broadcasts it over the WebSocket channel.
+///
+/// The agent can attach action buttons. Buttons with `kind: "agent"` hand the
+/// prompt back to the assistant when the user clicks them, so a notification
+/// can offer a next step ("retry", "explain", "publish anyway") instead of
+/// being a dead end.
 async fn notify_user(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     let title = args.get("title").and_then(|v| v.as_str()).ok_or_else(|| {
         ApiError::Unprocessable("title is required".into())
     })?;
     let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let user_id = args.get("user_id").and_then(|v| v.as_str()).unwrap_or_default();
+
+    // Optional severity, validated so an unknown value cannot corrupt the
+    // column's CHECK constraint.
+    let severity = match args.get("severity").and_then(|v| v.as_str()) {
+        Some("success") => "success",
+        Some("warning") => "warning",
+        Some("error") => "error",
+        _ => "info",
+    };
+
+    let actions = parse_notification_actions(args.get("actions"))?;
+
     let service = crate::services::notifications::NotificationService::new(state);
     let id = service
-        .create(user_id, "agent_message", title, body, None, None, None)
+        .create_with_actions(
+            user_id,
+            "agent_message",
+            title,
+            body,
+            crate::services::notifications::NotificationOptions { severity, actions },
+        )
         .await
         .map_err(ApiError::from)?;
     Ok(json!({ "notification_id": id, "delivered": true }))
+}
+
+/// Validate the `actions` argument for notifications. Accepted shape:
+/// `[{ "label": "...", "prompt": "...", "style": "primary" }]`, where each
+/// entry becomes an agent action the user can trigger.
+fn parse_notification_actions(
+    raw: Option<&Value>,
+) -> Result<Vec<crate::services::notifications::NotificationAction>, ApiError> {
+    let Some(items) = raw.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    if items.len() > 4 {
+        return Err(ApiError::Unprocessable(
+            "at most 4 notification actions are allowed".into(),
+        ));
+    }
+    let mut actions = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let label = item
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::Unprocessable("each action needs a label".into()))?;
+        let prompt = item
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or(label)
+            .to_string();
+        let style = match item.get("style").and_then(|v| v.as_str()) {
+            Some("primary") => "primary",
+            Some("danger") => "danger",
+            _ => "",
+        };
+        actions.push(crate::services::notifications::NotificationAction {
+            id: item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("action_{index}")),
+            label: label.to_string(),
+            style: style.to_string(),
+            kind: "agent".to_string(),
+            payload: json!({ "prompt": prompt }),
+        });
+    }
+    Ok(actions)
 }
 
 // ---------------------------------------------------------------------------

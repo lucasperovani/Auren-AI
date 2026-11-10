@@ -117,6 +117,33 @@ async fn require_owned_agent(state: &AppState, user: &AuthUser, agent_id: &str) 
     Ok(())
 }
 
+/// The user's default agent, created on first use. Background flows (task
+/// planning, notification actions) need an agent before the user ever opens
+/// the chat, so this guarantees one exists without asking them to create it.
+pub async fn ensure_default_agent(state: &AppState, user_id: &str) -> ApiResult<String> {
+    if let Some(row) = sqlx::query("SELECT id FROM agents WHERE user_id = ? ORDER BY created_at LIMIT 1")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?
+    {
+        return Ok(row.get("id"));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO agents (id, user_id, name, instructions, status, settings_json, created_at, updated_at)
+         VALUES (?, ?, 'Assistant', '', 'active', '{}', ?, ?)",
+    )
+    .bind(&id)
+    .bind(user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await?;
+    Ok(id)
+}
+
 pub async fn get_agent(
     State(state): State<AppState>,
     user: AuthUser,

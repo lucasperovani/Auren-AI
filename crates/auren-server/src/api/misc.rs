@@ -165,8 +165,44 @@ pub fn notifications_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_notifications))
         .route("/read-all", post(read_all_notifications))
+        .route("/unread-count", get(unread_count))
         .route("/{notification_id}", get(get_notification).delete(delete_notification))
         .route("/{notification_id}/read", post(mark_read))
+        .route("/{notification_id}/actions/{action_id}", post(run_notification_action))
+}
+
+/// Fields shared by every notification representation.
+fn notification_json(r: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
+    let actions_raw: String = r.try_get("actions_json").unwrap_or_else(|_| "[]".into());
+    let actions: Vec<crate::services::notifications::NotificationAction> =
+        serde_json::from_str(&actions_raw).unwrap_or_default();
+    json!({
+        "id": r.get::<String, _>("id"),
+        "notification_type": r.get::<String, _>("notification_type"),
+        "title": r.get::<String, _>("title"),
+        "body": r.get::<String, _>("body"),
+        "severity": r.try_get::<String, _>("severity").unwrap_or_else(|_| "info".into()),
+        "actions": actions,
+        "action_id": r.try_get::<Option<String>, _>("action_id").unwrap_or(None),
+        "acted_at": r.try_get::<Option<String>, _>("acted_at").unwrap_or(None),
+        "read_at": r.get::<Option<String>, _>("read_at"),
+        "task_id": r.try_get::<Option<String>, _>("task_id").unwrap_or(None),
+        "task_run_id": r.try_get::<Option<String>, _>("task_run_id").unwrap_or(None),
+        "approval_request_id": r.try_get::<Option<String>, _>("approval_request_id").unwrap_or(None),
+        "created_at": r.get::<String, _>("created_at"),
+    })
+}
+
+/// Unread notification count for the sidebar badge.
+pub async fn unread_count(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL")
+        .bind(&user.id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(json!({ "unread": row.get::<i64, _>("n") })))
 }
 
 pub async fn list_notifications(
@@ -192,19 +228,7 @@ pub async fn list_notifications(
     let items: Vec<serde_json::Value> = rows
         .iter()
         .take(limit as usize)
-        .map(|r| {
-            json!({
-                "id": r.get::<String, _>("id"),
-                "notification_type": r.get::<String, _>("notification_type"),
-                "title": r.get::<String, _>("title"),
-                "body": r.get::<String, _>("body"),
-                "read_at": r.get::<Option<String>, _>("read_at"),
-                "task_id": r.get::<Option<String>, _>("task_id"),
-                "task_run_id": r.get::<Option<String>, _>("task_run_id"),
-                "approval_request_id": r.get::<Option<String>, _>("approval_request_id"),
-                "created_at": r.get::<String, _>("created_at"),
-            })
-        })
+        .map(notification_json)
         .collect();
     let next_cursor = if has_more {
         items.last().and_then(|i| i["id"].as_str()).map(pagination::encode_cursor)
@@ -237,14 +261,7 @@ pub async fn get_notification(
         .bind(&notification_id)
         .fetch_one(&state.db)
         .await?;
-    Ok(Json(json!({
-        "id": row.get::<String, _>("id"),
-        "notification_type": row.get::<String, _>("notification_type"),
-        "title": row.get::<String, _>("title"),
-        "body": row.get::<String, _>("body"),
-        "read_at": row.get::<Option<String>, _>("read_at"),
-        "created_at": row.get::<String, _>("created_at"),
-    })))
+    Ok(Json(notification_json(&row)))
 }
 
 /// Mark a notification as read. Reading never authorizes an operation
@@ -286,6 +303,64 @@ pub async fn delete_notification(
         .execute(&state.db)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Choose an action offered by a notification.
+///
+/// `dismiss` only closes it. `agent` hands the payload to the assistant, which
+/// decides what to do next (the notification becomes a request, never an
+/// authorization: privileged operations still go through approvals).
+pub async fn run_notification_action(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((notification_id, action_id)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_owned_notification(&state, &user, &notification_id).await?;
+
+    let svc = crate::services::notifications::NotificationService::new(&state);
+    let action = svc
+        .record_action(&user.id, &notification_id, &action_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::NotFound)?;
+
+    match action.kind.as_str() {
+        "dismiss" => Ok(Json(json!({ "status": "dismissed", "action_id": action.id }))),
+        "agent" => {
+            let prompt = action
+                .payload
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&action.label)
+                .to_string();
+
+            // Route through the user's default agent, creating one lazily so
+            // the action works even before the user opens the chat.
+            let agent_id = crate::api::agents::ensure_default_agent(&state, &user.id).await?;
+            let conversation_id =
+                crate::api::conversations::ensure_action_conversation(&state, &user.id, &agent_id)
+                    .await?;
+
+            let turn = crate::api::conversations::run_agent_turn(
+                &state,
+                &conversation_id,
+                &agent_id,
+                &prompt,
+            )
+            .await?;
+
+            Ok(Json(json!({
+                "status": "dispatched",
+                "action_id": action.id,
+                "conversation_id": conversation_id,
+                "reply": turn.reply,
+                "error": turn.error,
+            })))
+        }
+        other => Err(ApiError::Unprocessable(format!(
+            "unsupported notification action kind '{other}'"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------

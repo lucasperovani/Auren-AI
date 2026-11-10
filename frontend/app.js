@@ -304,6 +304,7 @@ async function enterApp() {
   collapseBtn.onclick = () => applyCollapse(!sidebar.classList.contains('collapsed'));
   applyCollapse(sessionStorage.getItem('auren_sidebar_collapsed') === '1');
   refreshApprovalsBadge();
+  refreshNotificationBadge();
   navigate(location.hash.replace('#', '') || 'dashboard');
 }
 
@@ -363,17 +364,36 @@ async function connectWebSocket() {
 
 function onLiveEvent(envelope) {
   if (envelope.event_type === 'notification.created') {
-    toast('New notification', 'success');
+    const severity = envelope.data?.severity || 'info';
+    const label = severity === 'error' ? 'Something needs attention'
+      : severity === 'warning' ? 'Check your notifications'
+        : 'New notification';
+    toast(label, severity === 'error' ? 'error' : 'success');
+    refreshNotificationBadge();
   } else if (envelope.event_type === 'task_run.approval_required') {
     toast('An operation requires your approval', 'error');
     refreshApprovalsBadge();
   } else if (envelope.event_type === 'approval.updated') {
     refreshApprovalsBadge();
+  } else if (envelope.event_type === 'notification.acted') {
+    refreshNotificationBadge();
   } else if (envelope.event_type.startsWith('task.')) {
     // Refresh the current view when task state changes.
     navigate(location.hash.replace('#', '') || 'dashboard');
   }
 }
+
+/// Unread notifications badge on the sidebar.
+async function refreshNotificationBadge() {
+  const badge = document.getElementById('notifications-badge');
+  if (!badge) return;
+  try {
+    const { unread } = await api('GET', '/notifications/unread-count');
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+    badge.classList.toggle('hidden', !unread);
+  } catch { /* badge is best-effort */ }
+}
+
 
 /// Update the red pending-approvals badge next to the sidebar link.
 async function refreshApprovalsBadge() {
@@ -452,10 +472,13 @@ views.dashboard = async (content) => {
 
     <div class="section-head">
       <h3 class="section-title">Recent activity</h3>
+      <span class="spacer"></span>
+      <a href="#notifications" class="btn btn-sm btn-secondary">All notifications</a>
     </div>
     ${notifications.items.length ? notifications.items.map((n) => `
       <div class="card" style="margin-bottom:10px">
         <div style="display:flex;align-items:center;gap:10px">
+          <span class="notif-sev ${severityMeta(n.severity).cls}" aria-hidden="true">${severityMeta(n.severity).icon}</span>
           <strong>${esc(n.title)}</strong>
           <span class="spacer"></span>
           <span class="muted" style="font-size:.8rem">${esc(relativeTime(n.created_at))}</span>
@@ -1069,6 +1092,207 @@ async function showRunHistory(task) {
 
 
 // ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+let notificationFilter = sessionStorage.getItem('auren_notif_filter') || 'all';
+
+const NOTIFICATION_FILTERS = [
+  { id: 'all', label: 'All' },
+  { id: 'unread', label: 'Unread' },
+  { id: 'action', label: 'Needs a decision' },
+  { id: 'warning', label: 'Warnings' },
+  { id: 'error', label: 'Errors' },
+];
+
+/** Icon and accent for a notification severity. */
+function severityMeta(severity) {
+  switch (severity) {
+    case 'error': return { icon: '✕', cls: 'sev-error' };
+    case 'warning': return { icon: '!', cls: 'sev-warning' };
+    case 'success': return { icon: '✓', cls: 'sev-success' };
+    default: return { icon: 'i', cls: 'sev-info' };
+  }
+}
+
+views.notifications = async (content) => {
+  const { items } = await api('GET', '/notifications?limit=100');
+
+  const unread = items.filter((n) => !n.read_at).length;
+  const pendingActions = items.filter((n) => n.actions?.length && !n.action_id).length;
+
+  const visible = items.filter((n) => {
+    switch (notificationFilter) {
+      case 'unread': return !n.read_at;
+      case 'action': return n.actions?.length > 0 && !n.action_id;
+      case 'warning': return n.severity === 'warning';
+      case 'error': return n.severity === 'error';
+      default: return true;
+    }
+  });
+
+  const counts = {
+    all: items.length,
+    unread,
+    action: pendingActions,
+    warning: items.filter((n) => n.severity === 'warning').length,
+    error: items.filter((n) => n.severity === 'error').length,
+  };
+
+  content.innerHTML = `
+    ${pageHead(
+      'Notifications',
+      'Updates from the agent and the system. Some carry actions you can take right away.',
+      `
+        <button class="btn btn-secondary" id="notif-read-all" ${unread ? '' : 'disabled'}>Mark all read</button>
+        <button class="btn btn-secondary" id="notif-clear" ${items.length ? '' : 'disabled'}>Clear read</button>
+      `,
+    )}
+    <div class="task-toolbar">
+      ${NOTIFICATION_FILTERS.map((f) => `
+        <button class="filter-chip ${f.id === notificationFilter ? 'active' : ''}" data-notif-filter="${f.id}">
+          ${esc(f.label)}${counts[f.id] ? ` · ${counts[f.id]}` : ''}
+        </button>`).join('')}
+    </div>
+    <div class="notif-list">
+      ${visible.length ? visible.map((n) => notificationCardHtml(n)).join('')
+        : emptyState(
+            items.length ? 'Nothing in this filter.' : 'No notifications yet.',
+            '✉',
+          )}
+    </div>
+  `;
+
+  content.querySelectorAll('[data-notif-filter]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      notificationFilter = chip.dataset.notifFilter;
+      sessionStorage.setItem('auren_notif_filter', notificationFilter);
+      navigate('notifications');
+    });
+  });
+
+  const readAll = document.getElementById('notif-read-all');
+  if (readAll) {
+    readAll.addEventListener('click', async () => {
+      try {
+        await api('POST', '/notifications/read-all', {});
+        refreshNotificationBadge();
+        navigate('notifications');
+      } catch (err) { toast(err.message, 'error'); }
+    });
+  }
+
+  const clear = document.getElementById('notif-clear');
+  if (clear) {
+    clear.addEventListener('click', async () => {
+      const read = items.filter((n) => n.read_at);
+      if (!read.length) { toast('No read notifications to clear', 'error'); return; }
+      if (!confirm(`Delete ${read.length} read notification(s)?`)) return;
+      clear.disabled = true;
+      let removed = 0;
+      let failed = 0;
+      for (const n of read) {
+        try {
+          await api('DELETE', `/notifications/${n.id}`);
+          removed += 1;
+        } catch { failed += 1; }
+      }
+      refreshNotificationBadge();
+      if (failed) toast(`Cleared ${removed}, ${failed} failed`, 'error');
+      else toast(`Cleared ${removed} notification${removed === 1 ? '' : 's'}`, 'success');
+      navigate('notifications');
+    });
+  }
+
+  // Per-notification interactions.
+  content.querySelectorAll('.notif-card').forEach((card) => {
+    const id = card.dataset.id;
+
+    card.querySelectorAll('[data-notif-action]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const actionId = btn.dataset.notifAction;
+        const kind = btn.dataset.kind;
+        if (kind === 'agent' && !confirm('Let the agent act on this now?')) return;
+
+        btn.disabled = true;
+        card.querySelectorAll('[data-notif-action]').forEach((b) => { b.disabled = true; });
+        try {
+          const result = await api('POST', `/notifications/${id}/actions/${actionId}`, {});
+          if (result.conversation_id && result.reply) {
+            toast('The agent is on it — see Chat', 'success');
+            currentConversationId = result.conversation_id;
+            sessionStorage.setItem('auren_conv', currentConversationId);
+          } else {
+            toast('Done', 'success');
+          }
+          navigate('notifications');
+        } catch (err) {
+          toast(err.message, 'error');
+          btn.disabled = false;
+          card.querySelectorAll('[data-notif-action]').forEach((b) => { b.disabled = false; });
+        }
+      });
+    });
+
+    const readBtn = card.querySelector('[data-notif-read]');
+    if (readBtn) {
+      readBtn.addEventListener('click', async () => {
+        try {
+          await api('POST', `/notifications/${id}/read`, {});
+          refreshNotificationBadge();
+          navigate('notifications');
+        } catch (err) { toast(err.message, 'error'); }
+      });
+    }
+
+    const deleteBtn = card.querySelector('[data-notif-delete]');
+    if (deleteBtn) {
+      deleteBtn.addEventListener('click', async () => {
+        try {
+          await api('DELETE', `/notifications/${id}`);
+          refreshNotificationBadge();
+          navigate('notifications');
+        } catch (err) { toast(err.message, 'error'); }
+      });
+    }
+  });
+};
+
+/** One notification card with its severity, actions, and metadata. */
+function notificationCardHtml(n) {
+  const sev = severityMeta(n.severity);
+  const actions = Array.isArray(n.actions) ? n.actions : [];
+  const acted = Boolean(n.acted_at);
+
+  const actionButtons = actions.map((a) => {
+    const style = a.style === 'primary' ? '' : a.style === 'danger' ? ' btn-danger' : ' btn-secondary';
+    return `<button class="btn btn-sm${style}" data-notif-action="${esc(a.id)}" data-kind="${esc(a.kind)}" ${acted ? 'disabled' : ''}>${esc(a.label)}</button>`;
+  }).join('');
+
+  return `
+    <div class="notif-card ${n.read_at ? 'is-read' : 'is-unread'} ${sev.cls}" data-id="${esc(n.id)}">
+      <div class="notif-head">
+        <span class="notif-sev ${sev.cls}" aria-hidden="true">${sev.icon}</span>
+        <div class="notif-title-wrap">
+          <div class="notif-title">${esc(n.title)}</div>
+          <div class="notif-meta muted">
+            ${esc(relativeTime(n.created_at))}
+            ${n.notification_type ? ` · ${esc(n.notification_type.replace(/_/g, ' '))}` : ''}
+            ${acted ? ' · action taken' : ''}
+          </div>
+        </div>
+        <span class="spacer"></span>
+        ${n.read_at ? '' : '<span class="badge draft plain">unread</span>'}
+        <button class="btn-icon" data-notif-read="${esc(n.id)}" title="Mark as read"
+          ${n.read_at ? 'disabled' : ''}>✓</button>
+        <button class="btn-icon danger" data-notif-delete="${esc(n.id)}" title="Delete">✕</button>
+      </div>
+      ${n.body ? `<div class="notif-body">${esc(n.body)}</div>` : ''}
+      ${actionButtons ? `<div class="notif-actions">${actionButtons}</div>` : ''}
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
 // Skills
 // ---------------------------------------------------------------------------
 
@@ -1090,6 +1314,20 @@ views.skills = async (content) => {
           <p class="muted" style="margin-bottom:14px; font-size:.87rem">${esc(b.description)}</p>
           <button class="btn btn-sm" data-install="${esc(b.id)}">Install</button>
         </div>`).join('')}</div>` : ''}
+    <div class="card" style="margin-bottom:24px">
+      <h3>Import from a GitHub repository</h3>
+      <p class="muted" style="margin:6px 0 14px; font-size:.87rem">
+        Point at a repository to list the skills, tools, and MCP servers it provides. Nothing is installed until you choose it.
+      </p>
+      <div class="form-row" style="max-width:560px">
+        <div style="display:flex;gap:8px">
+          <input id="import-repo" placeholder="owner/repo or https://github.com/owner/repo" style="flex:1">
+          <button class="btn" id="import-discover">Scan</button>
+        </div>
+        <p class="field-hint">Private repositories use your connected GitHub account.</p>
+      </div>
+      <div id="import-results"></div>
+    </div>
     <div class="card" style="margin-bottom:24px">
       <h3>Install a custom skill package</h3>
       <p class="muted" style="margin:6px 0 14px; font-size:.87rem">Upload a skill ZIP. It is validated before installation.</p>
@@ -1144,6 +1382,8 @@ views.skills = async (content) => {
       }
     });
   });
+
+  wireGithubImport(content);
 
   // File picker: show the selected file and reveal the upload button only
   // after a file is chosen.
@@ -1226,6 +1466,169 @@ views.skills = async (content) => {
     });
   });
 };
+
+/// Wire the "Import from GitHub" card: scan a repository, then install a
+/// discovered skill package through the normal validation pipeline.
+function wireGithubImport(content) {
+  const input = content.querySelector('#import-repo');
+  const scanBtn = content.querySelector('#import-discover');
+  const results = content.querySelector('#import-results');
+  if (!input || !scanBtn || !results) return;
+
+  // Remember the last scanned repository so the user can retry.
+  const lastRepo = sessionStorage.getItem('auren_import_repo');
+  if (lastRepo) input.value = lastRepo;
+
+  const runScan = async () => {
+    const repository = input.value.trim();
+    if (!repository) { toast('Enter a repository', 'error'); return; }
+    sessionStorage.setItem('auren_import_repo', repository);
+    scanBtn.disabled = true;
+    scanBtn.textContent = 'Scanning…';
+    results.innerHTML = '<div class="skeleton" style="height:64px"></div>';
+    try {
+      const found = await api('POST', '/skills/import/discover', { repository });
+      results.innerHTML = importResultsHtml(found);
+      wireInstallButtons(found);
+    } catch (err) {
+      results.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    } finally {
+      scanBtn.disabled = false;
+      scanBtn.textContent = 'Scan';
+    }
+  };
+
+  scanBtn.addEventListener('click', runScan);
+  input.addEventListener('keydown', (event) => { if (event.key === 'Enter') runScan(); });
+
+  const wireInstallButtons = (found) => {
+    results.querySelectorAll('[data-import-install]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = 'Installing…';
+        try {
+          const { upload_id: uploadId } = await api('POST', '/skills/import/install', {
+            repository: found.repository,
+            reference: found.reference,
+            skill_path: btn.dataset.importInstall,
+            install: true,
+          });
+          toast('Package downloaded; validating…', 'success');
+          // Same progress protocol as any upload.
+          const poll = setInterval(async () => {
+            try {
+              const status = await api('GET', `/skills/uploads/${uploadId}`);
+              if (['installed', 'failed', 'cancelled'].includes(status.status)) {
+                clearInterval(poll);
+                if (status.status === 'installed') toast(`${status.skill_id} installed`, 'success');
+                else toast(`Installation failed: ${status.error_message || 'unknown error'}`, 'error');
+                navigate('skills');
+              }
+            } catch (err) { clearInterval(poll); toast(err.message, 'error'); }
+          }, 1000);
+        } catch (err) {
+          toast(err.message, 'error');
+          btn.disabled = false;
+          btn.textContent = 'Install';
+        }
+      });
+    });
+
+    results.querySelectorAll('[data-import-mcp]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.dataset.importMcpName;
+        const url = btn.dataset.importMcpUrl;
+        if (!url) { toast('This server needs a local process and cannot be added here', 'error'); return; }
+        btn.disabled = true;
+        try {
+          await api('POST', '/mcp-servers', { name, url, auth_header: null });
+          toast('MCP server connected', 'success');
+          navigate('settings');
+        } catch (err) {
+          toast(err.message, 'error');
+          btn.disabled = false;
+        }
+      });
+    });
+  };
+
+  // Re-scan automatically when returning to the view with a saved repo.
+  if (lastRepo && results) runScan();
+}
+
+/** Render a discovery response: skills, tools, and MCP servers found. */
+function importResultsHtml(found) {
+  const total = found.skills.length + found.tools.length + found.mcp_servers.length;
+  const notes = (found.notes || []).length
+    ? `<div class="import-notes">${found.notes.map((n) => `<div class="muted">${esc(n)}</div>`).join('')}</div>`
+    : '';
+
+  if (!total) {
+    return `
+      <div class="empty-state" style="margin-top:14px">
+        <div class="empty-icon">🔍</div>
+        <div>Nothing importable found in ${esc(found.repository)} (${esc(found.reference)}).</div>
+        <div class="muted" style="font-size:.83rem">Expected a <code>skill.json</code>, a <code>tools/</code> folder, or a <code>.mcp.json</code> descriptor.</div>
+      </div>
+      ${notes}`;
+  }
+
+  const skills = found.skills.length ? `
+    <div class="import-group">
+      <div class="import-group-title">Skills · ${found.skills.length}</div>
+      ${found.skills.map((s) => `
+        <div class="import-item">
+          <div style="min-width:0">
+            <strong>${esc(s.name)}</strong>
+            <span class="badge active plain" style="margin-left:6px">v${esc(s.version)}</span>
+            <div class="muted" style="font-size:.82rem">${esc(s.description || s.id)}</div>
+            <div class="muted" style="font-size:.76rem"><code>${esc(s.path)}</code></div>
+          </div>
+          <span class="spacer"></span>
+          <button class="btn btn-sm" data-import-install="${esc(s.path)}">Install</button>
+        </div>`).join('')}
+    </div>` : '';
+
+  const tools = found.tools.length ? `
+    <div class="import-group">
+      <div class="import-group-title">Tool definitions · ${found.tools.length}</div>
+      ${found.tools.map((t) => `
+        <div class="import-item">
+          <div style="min-width:0">
+            <code>${esc(t.name)}</code>
+            <div class="muted" style="font-size:.82rem">${esc(t.description || 'No description')}</div>
+            <div class="muted" style="font-size:.76rem">${esc(t.path)}</div>
+          </div>
+          <span class="spacer"></span>
+          <span class="badge disabled plain">bundle with a skill</span>
+        </div>`).join('')}
+    </div>` : '';
+
+  const servers = found.mcp_servers.length ? `
+    <div class="import-group">
+      <div class="import-group-title">MCP servers · ${found.mcp_servers.length}</div>
+      ${found.mcp_servers.map((m) => `
+        <div class="import-item">
+          <div style="min-width:0">
+            <strong>${esc(m.name)}</strong>
+            <span class="badge ${m.transport === 'http' ? 'active' : 'disabled'} plain" style="margin-left:6px">${esc(m.transport)}</span>
+            <div class="muted" style="font-size:.82rem">${esc(m.url || 'Runs as a local process')}</div>
+          </div>
+          <span class="spacer"></span>
+          <button class="btn btn-sm btn-secondary" data-import-mcp
+            data-import-mcp-name="${esc(m.name)}" data-import-mcp-url="${esc(m.url || '')}"
+            ${m.transport === 'http' ? '' : 'disabled title="stdio servers cannot be launched server-side"'}>
+            ${m.transport === 'http' ? 'Connect' : 'Unsupported'}
+          </button>
+        </div>`).join('')}
+    </div>` : '';
+
+  return `
+    <div class="import-summary muted">
+      ${esc(found.repository)} @ <code>${esc(found.reference)}</code> — ${total} item${total === 1 ? '' : 's'} found
+    </div>
+    ${skills}${tools}${servers}${notes}`;
+}
 
 /// Show a skill's installed versions with per-version delete (old versions
 /// can be cleaned up; the active version is protected server-side).

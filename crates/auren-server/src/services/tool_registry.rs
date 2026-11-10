@@ -350,6 +350,62 @@ impl ToolRegistry {
         self.execute_declarative_with_account(skill_tool_id, &args, account_id.as_deref()).await
     }
 
+    /// Defer a metered operation when its quota is already exhausted, so the
+    /// caller never sends a request that is certain to be rejected. Returns
+    /// the tool result describing the deferral, or `None` to proceed.
+    async fn enforce_quota(
+        &self,
+        account_id: &str,
+        provider_type: &str,
+        operation: &str,
+        args: &Value,
+        policy: super::rate_limits::RateLimitPolicy,
+    ) -> Result<Option<Value>, ApiError> {
+        let quota = super::rate_limits::status(&self.state, account_id, policy).await?;
+        if !quota.exhausted() {
+            return Ok(None);
+        }
+        let user_id = self.account_owner(account_id).await?;
+        let deferred_id = super::rate_limits::defer(
+            &self.state,
+            account_id,
+            &user_id,
+            provider_type,
+            operation,
+            args,
+            &quota,
+            &format!(
+                "The {provider_type} {} limit of {} per window was reached.",
+                quota.bucket, quota.limit
+            ),
+        )
+        .await?;
+        Ok(Some(json!({
+            "deferred": true,
+            "reason": "rate_limited",
+            "deferred_operation_id": deferred_id,
+            "bucket": quota.bucket,
+            "used": quota.used,
+            "limit": quota.limit,
+            "retry_at": quota.resets_at.to_rfc3339(),
+            "message": "The account reached its provider rate limit. The operation was queued and will run automatically when the limit resets; the user has been notified.",
+        })))
+    }
+
+    /// Owner of an integration account, used to attribute notifications.
+    async fn account_owner(&self, account_id: &str) -> Result<String, ApiError> {
+        let row = sqlx::query(
+            "SELECT i.user_id FROM integrations i
+             JOIN integration_accounts a ON a.integration_id = i.id
+             WHERE a.id = ?",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+        Ok(row.try_get("user_id")?)
+    }
+
     /// Resolve the skill owner's active account for the skill's required
     /// integration (first provider in `required_integrations`).
     async fn resolve_skill_account(
@@ -458,7 +514,19 @@ impl ToolRegistry {
                     .await?
                     .ok_or(ApiError::NotFound)?
                     .try_get("provider_type")?;
-                return super::integrations::execute_integration_tool(
+
+                // Metered operations are checked before the call so an
+                // exhausted quota defers the work instead of failing it.
+                if let Some(policy) = super::rate_limits::policy_for(&provider_type, &reference) {
+                    if let Some(deferred) = self
+                        .enforce_quota(account_id, &provider_type, &reference, args, policy)
+                        .await?
+                    {
+                        return Ok(deferred);
+                    }
+                }
+
+                let result = super::integrations::execute_integration_tool(
                     &self.state,
                     &provider_type,
                     &reference,
@@ -466,6 +534,41 @@ impl ToolRegistry {
                     account_id,
                 )
                 .await;
+
+                // Consume quota only after the provider accepted the call;
+                // a rejected request must not burn the user's allowance.
+                if let Some(policy) = super::rate_limits::policy_for(&provider_type, &reference) {
+                    if result.is_ok() {
+                        if let Err(e) = super::rate_limits::consume(&self.state, account_id, policy).await {
+                            tracing::warn!(error = %e, "failed to record rate-limit usage");
+                        }
+                    } else if matches!(result, Err(ApiError::TooManyRequests)) {
+                        // The provider rejected the call for quota reasons:
+                        // defer and keep the user informed.
+                        let quota = super::rate_limits::status(&self.state, account_id, policy).await?;
+                        let user_id = self.account_owner(account_id).await?;
+                        super::rate_limits::defer(
+                            &self.state,
+                            account_id,
+                            &user_id,
+                            &provider_type,
+                            &reference,
+                            args,
+                            &quota,
+                            "The provider rejected the request because its rate limit was reached.",
+                        )
+                        .await?;
+                        return Ok(json!({
+                            "deferred": true,
+                            "reason": "rate_limited",
+                            "bucket": quota.bucket,
+                            "retry_at": quota.resets_at.to_rfc3339(),
+                            "message": "The provider rate limit was hit; the operation is queued and will run automatically once the limit resets.",
+                        }));
+                    }
+                }
+
+                return result;
             }
         }
 

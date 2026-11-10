@@ -435,6 +435,92 @@ pub struct ResumeRequest {
     pub approval_id: String,
 }
 
+/// Result of a single agent turn driven from outside the chat UI (for
+/// example when the user picks an action on a notification).
+pub struct AgentTurn {
+    pub reply: String,
+    pub tool_trace: Vec<serde_json::Value>,
+    pub error: bool,
+}
+
+/// Run one agent turn in a conversation: persist the user message, let the
+/// runtime answer, and persist the reply with its tool trace. Shared by the
+/// chat endpoint and notification actions so both behave identically.
+pub async fn run_agent_turn(
+    state: &AppState,
+    conversation_id: &str,
+    agent_id: &str,
+    prompt: &str,
+) -> ApiResult<AgentTurn> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(conversation_id)
+        .bind(prompt)
+        .bind(&now)
+        .execute(&state.db)
+        .await?;
+    sqlx::query("UPDATE conversations SET updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(&state.db)
+        .await?;
+
+    let runtime = crate::services::agent_runtime::AgentRuntime::new(state.clone());
+    let (reply, error) = match runtime.chat(agent_id, conversation_id, prompt).await {
+        Ok(reply) => (reply, false),
+        // Honest failure: the reply says why instead of pretending success.
+        Err(e) => (format!("The agent could not respond: {e}"), true),
+    };
+    let tool_trace = runtime.last_tool_trace.lock().expect("trace poisoned").clone();
+
+    sqlx::query("INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(conversation_id)
+        .bind(&reply)
+        .bind(json!({ "tool_trace": tool_trace }).to_string())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.db)
+        .await?;
+
+    Ok(AgentTurn { reply, tool_trace, error })
+}
+
+/// Conversation used to carry out notification actions: one per user, so the
+/// transcript stays readable instead of spawning a chat per click.
+pub async fn ensure_action_conversation(
+    state: &AppState,
+    user_id: &str,
+    agent_id: &str,
+) -> ApiResult<String> {
+    const TITLE: &str = "Notification actions";
+    if let Some(row) = sqlx::query(
+        "SELECT id FROM conversations WHERE user_id = ? AND title = ? ORDER BY created_at LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(TITLE)
+    .fetch_optional(&state.db)
+    .await?
+    {
+        return Ok(row.get("id"));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, agent_id, title, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'active', ?, ?)",
+    )
+    .bind(&id)
+    .bind(user_id)
+    .bind(agent_id)
+    .bind(TITLE)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await?;
+    Ok(id)
+}
+
 pub async fn resume_after_approval(
     State(state): State<AppState>,
     user: AuthUser,

@@ -574,6 +574,91 @@ body.sidebar-collapsed .content { margin-left: 0; }
   margin-top: auto; padding-top: 4px;
 }
 
+/* -----------------------------------------------------------------------
+   Notifications
+   ----------------------------------------------------------------------- */
+
+.notif-list { display: flex; flex-direction: column; gap: 10px; }
+
+.notif-card {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 16px 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.notif-card.is-unread { background: var(--bg-elevated); }
+.notif-card.sev-info { border-left-color: var(--accent); }
+.notif-card.sev-success { border-left-color: var(--success); }
+.notif-card.sev-warning { border-left-color: var(--warning); }
+.notif-card.sev-error { border-left-color: var(--danger); }
+
+.notif-head { display: flex; align-items: flex-start; gap: 10px; }
+
+.notif-sev {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; flex-shrink: 0;
+  border-radius: 50%; font-size: 0.72rem; font-weight: 700;
+}
+.notif-sev.sev-info { background: var(--accent-soft); color: var(--accent); }
+.notif-sev.sev-success { background: var(--success-soft); color: var(--success); }
+.notif-sev.sev-warning { background: var(--warning-soft); color: var(--warning); }
+.notif-sev.sev-error { background: var(--danger-soft); color: var(--danger); }
+
+.notif-title-wrap { min-width: 0; }
+
+.notif-title {
+  font-size: 0.95rem; font-weight: 650; line-height: 1.35;
+  word-break: break-word;
+}
+
+.notif-meta { font-size: 0.78rem; margin-top: 2px; }
+
+.notif-body {
+  font-size: 0.88rem; color: var(--text-soft); line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word;
+}
+
+.notif-actions {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding-top: 10px; border-top: 1px solid var(--border);
+}
+
+/* -----------------------------------------------------------------------
+   GitHub import results
+   ----------------------------------------------------------------------- */
+
+.import-summary {
+  margin: 14px 0 10px; font-size: 0.83rem;
+  padding-bottom: 10px; border-bottom: 1px solid var(--border);
+}
+
+.import-group { margin-top: 14px; }
+
+.import-group-title {
+  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.07em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 8px;
+}
+
+.import-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; margin-bottom: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.import-item strong { font-size: 0.89rem; }
+
+.import-notes {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 0.79rem; line-height: 1.6;
+}
+
 /* Tables */
 .table {
   width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.89rem;

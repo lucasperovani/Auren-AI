@@ -22,6 +22,34 @@ Skills are installable capability packages. Installation happens entirely throug
 | GET | `/api/v1/skills/{skill_id}/permissions` | Inspect declared permissions |
 | PUT | `/api/v1/skills/{skill_id}/permissions` | Update configurable permissions |
 | GET | `/api/v1/skills/{skill_id}/tools` | List the tools declared by the active version |
+| POST | `/api/v1/skills/import/discover` | List skills, tools, and MCP servers a GitHub repository provides |
+| POST | `/api/v1/skills/import/install` | Download and install a skill package discovered in a repository |
+
+## Importing from a repository
+
+`POST /skills/import/discover` takes `{ repository, integration_account_id? }`
+where `repository` is `owner/repo`, a GitHub URL, or a URL with
+`/tree/<ref>/<path>`. It returns the discovered items and the resolved
+reference:
+
+| Field | Contents |
+|---|---|
+| `repository` / `reference` | Normalized repository and the commit, branch, or tag scanned |
+| `skills` | Directories containing a `skill.json` (`path`, `id`, `name`, `version`) |
+| `tools` | JSON tool definitions found under `tools/` |
+| `mcp_servers` | `.mcp.json`/`mcp.json` entries with their `transport` |
+| `notes` | Skipped or unreadable files |
+
+Discovery never installs anything. `POST /skills/import/install` takes
+`{ repository, reference, skill_path, install }` and returns an `upload_id`
+that follows the regular upload status protocol, so a repository package goes
+through the same manifest, schema, and capability validation as an uploaded ZIP.
+
+Only `http` MCP servers can be connected from the UI; `stdio` servers would
+require launching a local process and are reported as unsupported.
+
+Private repositories use the user's connected GitHub account. Without one, only
+public repositories are readable.
 
 ## Rules
 

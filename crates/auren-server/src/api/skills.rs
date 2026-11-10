@@ -21,6 +21,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_skills))
         .route("/catalog", get(builtin_catalog))
+        .route("/import/discover", post(discover_imports))
+        .route("/import/install", post(install_imported_skill))
         .route("/catalog/{skill_id}/install", post(install_builtin))
         .route("/uploads", post(upload_skill))
         .route("/uploads/{upload_id}", get(get_upload))
@@ -57,6 +59,137 @@ pub async fn builtin_catalog() -> ApiResult<Json<serde_json::Value>> {
         .map(|(id, description)| serde_json::json!({ "id": id, "description": description }))
         .collect();
     Ok(Json(serde_json::json!({ "items": items, "next_cursor": null })))
+}
+
+// ---------------------------------------------------------------------------
+// Importing from a GitHub repository
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DiscoverRequest {
+    /// `owner/repo`, a GitHub URL, or a URL with `/tree/<ref>/<path>`.
+    pub repository: String,
+    /// Optional connected GitHub account, used for private repositories.
+    #[serde(default)]
+    pub integration_account_id: Option<String>,
+}
+
+/// Resolve a GitHub token for the request: an explicit connected account when
+/// given, otherwise the user's first active GitHub account. Public
+/// repositories work without a token.
+async fn github_access(
+    state: &AppState,
+    user: &AuthUser,
+    account_id: Option<&str>,
+) -> Result<crate::services::skill_import::GithubAccess, ApiError> {
+    let account = match account_id {
+        Some(id) => Some(id.to_string()),
+        None => sqlx::query(
+            "SELECT a.id FROM integration_accounts a
+             JOIN integrations i ON i.id = a.integration_id
+             WHERE i.user_id = ? AND i.provider_type = 'github'
+               AND i.status = 'connected' AND a.status = 'active'
+             ORDER BY a.created_at LIMIT 1",
+        )
+        .bind(&user.id)
+        .fetch_optional(&state.db)
+        .await?
+        .and_then(|r| r.try_get("id").ok()),
+    };
+
+    let Some(account_id) = account else {
+        return Ok(crate::services::skill_import::GithubAccess { token: None });
+    };
+
+    let row = sqlx::query(
+        "SELECT c.ciphertext, c.nonce FROM encrypted_credentials c
+         WHERE c.integration_account_id = ?",
+    )
+    .bind(&account_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let token = match row {
+        Some(r) => {
+            let ciphertext: Vec<u8> = r.get("ciphertext");
+            let nonce: Vec<u8> = r.get("nonce");
+            crate::services::credentials::decrypt_credential(
+                &ciphertext,
+                &nonce,
+                &state.config.credential_encryption_key,
+            )
+            .ok()
+        }
+        None => None,
+    };
+    Ok(crate::services::skill_import::GithubAccess { token })
+}
+
+/// List what a repository provides: skill packages, tool definitions, and
+/// MCP servers. Nothing is installed by this call.
+pub async fn discover_imports(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<DiscoverRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let repo = crate::services::skill_import::RepoRef::parse(&req.repository)?;
+    let access = github_access(&state, &user, req.integration_account_id.as_deref()).await?;
+    let discovery = crate::services::skill_import::discover(&state, &repo, &access).await?;
+    Ok(Json(serde_json::to_value(discovery).map_err(|_| {
+        ApiError::Internal(anyhow::anyhow!("failed to serialize discovery"))
+    })?))
+}
+
+#[derive(Deserialize)]
+pub struct InstallImportedRequest {
+    pub repository: String,
+    /// Resolved reference from the discovery response.
+    pub reference: String,
+    /// Directory of the skill package inside the repository.
+    pub skill_path: String,
+    /// When false, the catalog is returned without installing anything.
+    #[serde(default)]
+    pub install: bool,
+    #[serde(default)]
+    pub integration_account_id: Option<String>,
+}
+
+/// Install a skill found by discovery. The package goes through the same
+/// validation pipeline as an uploaded ZIP: an arbitrary repository cannot
+/// bypass manifest, schema, or capability checks.
+pub async fn install_imported_skill(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<InstallImportedRequest>,
+) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+    let repo = crate::services::skill_import::RepoRef::parse(&req.repository)?;
+    let access = github_access(&state, &user, req.integration_account_id.as_deref()).await?;
+
+    if !req.install {
+        return Ok((
+            axum::http::StatusCode::OK,
+            Json(json!({ "installed": false, "skill_path": req.skill_path })),
+        ));
+    }
+
+    let bytes = crate::services::skill_import::download_skill_package(
+        &repo,
+        &req.reference,
+        &req.skill_path,
+        &access,
+    )
+    .await?;
+
+    let svc = SkillInstallationService::new(&state);
+    let upload_id = svc.install(&user.id, bytes).await?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({
+            "upload_id": upload_id,
+            "skill_path": req.skill_path,
+            "source": format!("{}/{}", repo.owner, repo.repo),
+        })),
+    ))
 }
 
 /// Install a built-in skill from the embedded packages. The package goes

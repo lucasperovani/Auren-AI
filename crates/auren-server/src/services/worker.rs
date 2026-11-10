@@ -83,5 +83,95 @@ pub async fn tick_once(state: &AppState, worker_id: &str) -> anyhow::Result<()> 
             }
         }
     }
+
+    // Retry operations that were deferred by a provider rate limit. They run
+    // exactly once per scheduled attempt: no polling, no agent involvement.
+    retry_deferred_operations(state).await?;
+
     Ok(())
+}
+
+/// How many deferred operations to attempt per tick.
+const DEFERRED_BATCH: i64 = 5;
+
+/// Run deferred provider operations whose rate-limit window has reopened.
+async fn retry_deferred_operations(state: &AppState) -> anyhow::Result<()> {
+    let operations = crate::services::rate_limits::due_operations(state, DEFERRED_BATCH)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load deferred operations: {e}"))?;
+
+    for operation in operations {
+        let result = crate::services::integrations::execute_integration_tool(
+            state,
+            // The provider is resolved from the account, never trusted from
+            // the stored payload.
+            &provider_of(state, &operation.account_id).await?,
+            &operation.operation,
+            &operation.payload,
+            &operation.account_id,
+        )
+        .await;
+
+        match result {
+            Ok(value) => {
+                // Record the usage now that the call went through.
+                if let Some(policy) =
+                    crate::services::rate_limits::policy_for(
+                        &provider_of(state, &operation.account_id).await?,
+                        &operation.operation,
+                    )
+                {
+                    let _ = crate::services::rate_limits::consume(
+                        state,
+                        &operation.account_id,
+                        policy,
+                    )
+                    .await;
+                }
+                crate::services::rate_limits::complete(state, &operation, &value).await;
+            }
+            Err(crate::error::ApiError::TooManyRequests) => {
+                // Still limited: wait for the next window instead of burning
+                // attempts.
+                let policy = crate::services::rate_limits::policy_for(
+                    &provider_of(state, &operation.account_id).await?,
+                    &operation.operation,
+                );
+                let retry_at = match policy {
+                    Some(p) => crate::services::rate_limits::status(state, &operation.account_id, p)
+                        .await
+                        .map(|q| q.resets_at.to_rfc3339())
+                        .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339()),
+                    None => chrono::Utc::now().to_rfc3339(),
+                };
+                let _ = sqlx::query(
+                    "UPDATE deferred_operations SET available_at = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(&retry_at)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(&operation.id)
+                .execute(&state.db)
+                .await;
+            }
+            Err(error) => {
+                crate::services::rate_limits::retry_later(state, &operation, &error.to_string())
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Provider type behind an integration account.
+async fn provider_of(state: &AppState, account_id: &str) -> anyhow::Result<String> {
+    let row = sqlx::query(
+        "SELECT i.provider_type FROM integrations i
+         JOIN integration_accounts a ON a.integration_id = i.id
+         WHERE a.id = ?",
+    )
+    .bind(account_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("integration account {account_id} no longer exists"))?;
+    Ok(row.try_get("provider_type")?)
 }

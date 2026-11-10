@@ -491,6 +491,194 @@ async fn notifications_lifecycle() {
     assert!(body["read_at"].is_string());
 }
 
+/// Notifications carry a severity and action buttons, the user can pick an
+/// action, and deleting removes it from the inbox.
+#[tokio::test]
+async fn notification_actions_roundtrip() {
+    let (app, state, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let user = crate::api::auth_user::AuthUser::from_token(&state, &token).await.unwrap();
+
+    let svc = crate::services::notifications::NotificationService::new(&state);
+    let id = svc
+        .create_with_actions(
+            &user.id,
+            "rate_limit",
+            "Limit reached",
+            "Queued the operation.",
+            crate::services::notifications::NotificationOptions {
+                severity: "warning",
+                actions: vec![crate::services::notifications::NotificationAction {
+                    id: "dismiss_it".into(),
+                    label: "Dismiss".into(),
+                    style: String::new(),
+                    kind: "dismiss".into(),
+                    payload: json!({}),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+    // The list exposes severity and actions.
+    let (status, list) = get_json(&app, "/api/v1/notifications?limit=10", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = list["items"].as_array().unwrap().iter().find(|i| i["id"] == id).unwrap().clone();
+    assert_eq!(item["severity"], "warning");
+    assert_eq!(item["actions"][0]["id"], "dismiss_it");
+    assert!(item["action_id"].is_null());
+
+    // Unread count reflects the new notification.
+    let (status, count) = get_json(&app, "/api/v1/notifications/unread-count", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(count["unread"], 1);
+
+    // Choosing an action records it and marks the notification read.
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/notifications/{id}/actions/dismiss_it"),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "dismissed");
+    let (_, detail) = get_json(&app, &format!("/api/v1/notifications/{id}"), Some(&token)).await;
+    assert_eq!(detail["action_id"], "dismiss_it");
+    assert!(detail["acted_at"].is_string());
+    assert!(detail["read_at"].is_string());
+
+    // An unknown action is rejected, never silently accepted.
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/notifications/{id}/actions/nope"),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Deleting removes it from the inbox.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/notifications/{id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (status, _) = get_json(&app, &format!("/api/v1/notifications/{id}"), Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A metered operation whose quota is exhausted is deferred, not failed, and
+/// the user is notified once. The worker only runs it after the window opens.
+#[tokio::test]
+async fn exhausted_quota_defers_instead_of_failing() {
+    let (app, state, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let user = crate::api::auth_user::AuthUser::from_token(&state, &token).await.unwrap();
+
+    // A connected Instagram account with a stored token.
+    sqlx::query("INSERT INTO integrations (id, user_id, provider_type, display_name, status, created_at, updated_at) VALUES ('i1', ?, 'instagram', 'IG', 'connected', '2026', '2026')")
+        .bind(&user.id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO integration_accounts (id, integration_id, external_account_id, display_name, status, created_at, updated_at) VALUES ('a1', 'i1', 'ext', 'IG', 'active', '2026', '2026')")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let policy = crate::services::rate_limits::INSTAGRAM_PUBLISH;
+    // Fill the quota.
+    for _ in 0..policy.limit {
+        crate::services::rate_limits::consume(&state, "a1", policy).await.unwrap();
+    }
+    let status_before = crate::services::rate_limits::status(&state, "a1", policy).await.unwrap();
+    assert!(status_before.exhausted());
+    assert_eq!(status_before.remaining(), 0);
+
+    // Deferring records the operation and notifies the user.
+    let deferred_id = crate::services::rate_limits::defer(
+        &state, "a1", &user.id, "instagram", "publish_media",
+        &json!({ "image_url": "https://example.com/a.jpg" }),
+        &status_before,
+        "The publishing limit was reached.",
+    )
+    .await
+    .unwrap();
+
+    // Repeating the same operation does not queue a duplicate.
+    let again = crate::services::rate_limits::defer(
+        &state, "a1", &user.id, "instagram", "publish_media",
+        &json!({ "image_url": "https://example.com/a.jpg" }),
+        &status_before,
+        "The publishing limit was reached.",
+    )
+    .await
+    .unwrap();
+    assert_eq!(deferred_id, again);
+    let queued: i64 = sqlx::query("SELECT COUNT(*) AS n FROM deferred_operations WHERE status = 'pending'")
+        .fetch_one(&state.db).await.unwrap().get("n");
+    assert_eq!(queued, 1);
+
+    // The notification explains the wait and offers a next step.
+    let (_, list) = get_json(&app, "/api/v1/notifications?limit=10", Some(&token)).await;
+    let notification = list["items"].as_array().unwrap().iter()
+        .find(|n| n["notification_type"] == "rate_limit")
+        .expect("rate-limit notification created");
+    assert_eq!(notification["severity"], "warning");
+    assert_eq!(notification["actions"][0]["kind"], "agent");
+
+    // The operation is scheduled in the future, so no worker picks it up now.
+    let due = crate::services::rate_limits::due_operations(&state, 10).await.unwrap();
+    assert!(due.is_empty(), "deferred work must not run before the window opens");
+
+    // The UI can read the account's quota and queue.
+    let (status, usage) = get_json(&app, "/api/v1/integrations/i1/accounts/a1/rate-limits", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let publish = usage["limits"].as_array().unwrap().iter()
+        .find(|l| l["bucket"] == "publish").expect("publish bucket reported");
+    assert_eq!(publish["limit"], 50);
+    assert_eq!(publish["remaining"], 0);
+    assert_eq!(usage["deferred"].as_array().unwrap().len(), 1);
+    assert_eq!(usage["deferred"][0]["operation"], "publish_media");
+}
+
+/// Deferring is only used for metered providers; a successful call consumes
+/// quota that a later call cannot exceed.
+#[tokio::test]
+async fn quota_rolls_over_after_the_window() {
+    let (_app, state, _d) = app().await;
+    // Start with an already-expired window: usage must read as zero.
+    sqlx::query("INSERT INTO users (id, email, display_name, password_hash, is_admin, created_at, updated_at) VALUES ('u1','a@b.com','A','x',1,'2026','2026')")
+        .execute(&state.db).await.unwrap();
+    sqlx::query("INSERT INTO integrations (id, user_id, provider_type, display_name, status, created_at, updated_at) VALUES ('i1', 'u1', 'instagram', 'IG', 'connected', '2026', '2026')")
+        .execute(&state.db).await.unwrap();
+    sqlx::query("INSERT INTO integration_accounts (id, integration_id, external_account_id, display_name, status, created_at, updated_at) VALUES ('a1', 'i1', 'ext', 'IG', 'active', '2026', '2026')")
+        .execute(&state.db).await.unwrap();
+
+    let policy = crate::services::rate_limits::INSTAGRAM_PUBLISH;
+    let long_ago = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO rate_limit_usage (id, integration_account_id, bucket, window_seconds, used, limit_value, window_started_at, updated_at)
+         VALUES ('r1', 'a1', 'publish', ?, 50, 50, ?, ?)",
+    )
+    .bind(policy.window_seconds)
+    .bind(&long_ago)
+    .bind(&long_ago)
+    .execute(&state.db).await.unwrap();
+
+    let status = crate::services::rate_limits::status(&state, "a1", policy).await.unwrap();
+    assert_eq!(status.used, 0, "an expired window must not carry usage over");
+    assert!(!status.exhausted());
+}
+
 /// The task payload carries everything the UI needs to describe a schedule in
 /// plain language: the cron, the next fire time, and the latest run.
 #[tokio::test]
