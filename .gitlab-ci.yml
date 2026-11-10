@@ -42,7 +42,11 @@ build-arm64:
     # Redirect the container store into the cached directory. Exported here
     # rather than in `variables:` because it needs shell expansion.
     - export STORAGE_OPTS="graphroot=$BUILDAH_STORE/storage runroot=$BUILDAH_STORE/runroot"
-    - if [ -d "$BUILDAH_STORE" ]; then du -sh "$BUILDAH_STORE"; else echo "cold cache: building from scratch"; fi
+    # NOTE: every item is quoted. An unquoted `echo "text: more"`
+    # contains ": " which YAML reads as a key/value separator, turning the
+    # item into a mapping — and GitLab then rejects before_script with
+    # "should be a string or a nested array of strings".
+    - if [ -d "$BUILDAH_STORE" ]; then du -sh "$BUILDAH_STORE"; else echo "cache cold, building from scratch"; fi
   script:
     # --arch aarch64 makes the final image arm64 even when the runner is amd64,
     # and the musl target produces a static binary for that architecture.
