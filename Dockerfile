@@ -78,25 +78,49 @@ COPY --from=builder /out/auren-server /auren-server
 RUN upx --best --lzma --force /auren-server
 
 # ---------------------------------------------------------------------------
-# Runtime: app-announcer supervises the server and announces it on the LAN.
-# The base image is arm64 only, which is why the whole build targets arm64.
+# The announcer image, referenced as a stage so `COPY --from=announcer` can pull
+# files out of it in the runtime stage.
 # ---------------------------------------------------------------------------
-FROM --platform=linux/arm64 registry.gitlab.com/lucas.perovani/app-announcer:latest
-ARG TARGET=aarch64-unknown-linux-musl
+FROM --platform=linux/arm64 registry.gitlab.com/lucas.perovani/app-announcer:latest AS announcer
+
+# ---------------------------------------------------------------------------
+# Runtime
+#
+# The published app-announcer image is built `FROM scratch`: it holds only
+# `/app/app-announcer`, `/app/assets` and the CA bundle — there is no shell, no
+# `/bin`, and therefore no `RUN` can execute inside it. Any `RUN` against that
+# base fails with:
+#
+#     fork/exec /bin/sh: no such file or directory
+#
+# Its binary is statically linked, so it runs on any Linux rootfs. This stage
+# therefore uses Alpine as the base and copies the announcer *out* of the
+# original image. That keeps the announcer (and its mDNS supervision) while
+# restoring a shell, `apk`, and busybox `wget` for the health check.
+#
+# Alpine is also what makes Chromium possible at all: it can only be installed
+# by a package manager.
+# ---------------------------------------------------------------------------
+FROM --platform=linux/arm64 alpine:3.21 AS runtime
 ARG WITH_BROWSER=false
 
-# Chromium is ~180 MB, more than everything else combined. It is installed only
-# on request so the default image stays small.
+# ca-certificates is always installed: the announcer points SSL_CERT_FILE at the
+# system bundle, and outbound HTTPS from the server needs it.
 #
-# When it is absent the server detects that at startup and *hides* the tools
-# that need it: the agent is never offered `web_navigate`, so a user cannot hit
-# a silent failure. No environment variable is needed either way: the server
-# probes PATH, and Alpine installs `/usr/bin/chromium-browser`.
-RUN if [ "$WITH_BROWSER" = "true" ]; then \
-        apk add --no-cache chromium ca-certificates; \
+# Chromium is ~180 MB, more than everything else combined, so it is opt-in.
+# When absent the server detects that at startup and *hides* the tools that need
+# it: the agent is never offered `web_navigate`, so a user cannot hit a silent
+# failure. Alpine installs `/usr/bin/chromium-browser`.
+RUN apk add --no-cache ca-certificates \
+ && if [ "$WITH_BROWSER" = "true" ]; then \
+        apk add --no-cache chromium; \
     else \
         echo "Chromium skipped (WITH_BROWSER=false); web_navigate will not be offered"; \
     fi
+
+# The announcer binary and the assets it serves (`/icon`, `app_info.json`).
+COPY --from=announcer /app/app-announcer /app/app-announcer
+COPY --from=announcer /app/assets /app/assets
 
 COPY --from=compress /auren-server /app/auren-server
 # The SPA is served from disk, so the assets ship inside the image.
@@ -110,7 +134,7 @@ ENV APP_INSTANCE_NAME=auren \
     APP_HOSTNAME=auren \
     APP_PORT=8080 \
     ANNOUNCER_PORT=7777 \
-    APP_ASSETS_DIR=/static \
+    APP_ASSETS_DIR=/app/assets \
     AUREN_BIND_ADDR=0.0.0.0:8080 \
     AUREN_DATABASE_URL=sqlite:///data/auren.db?mode=rwc \
     AUREN_FRONTEND_DIR=/static \
@@ -119,11 +143,27 @@ ENV APP_INSTANCE_NAME=auren \
     AUREN_WORKSPACE_DIR=/workspace \
     AI_WORKSPACE_CONTAINER_PATH=/workspace
 
+# These two were inherited from the original base image's ENV and are NOT
+# defaults in the announcer binary. Switching the base to Alpine silently loses
+# them, which would break mDNS discovery and certificate verification, so they
+# are restated explicitly.
+#
+#   APP_MDNS_SERVICE_TYPE  the mDNS service type the announcer registers
+#   SSL_CERT_FILE          bundle used for outbound TLS by the Rustls stack
+ENV APP_MDNS_SERVICE_TYPE=_app._tcp.local. \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# NOTE: APP_ASSETS_DIR points at the *announcer's* assets, not at /static.
+# The announcer serves `/icon` and `/app_info` from there, so pointing it at the
+# SPA directory would only ever return its 1x1 placeholder. The server has its
+# own variable (AUREN_FRONTEND_DIR) for the SPA.
 RUN mkdir -p /data/skills /workspace
 
 EXPOSE 8080
 
 # Health is served by the app itself; the announcer only supervises it.
+# busybox `wget` comes with Alpine, so this works — it did not exist on the
+# scratch base, where the container could never report healthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8080/health/ready >/dev/null 2>&1 || exit 1
 

@@ -23,7 +23,9 @@ services:
       # volume so the deployment works out of the box.
       - ${AI_WORKSPACE_HOST_PATH:-auren-workspace}:/workspace
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health/ready"]
+      # busybox `wget`, which ships with the Alpine runtime base. `curl` is not
+      # installed in the image, so using it here would always report unhealthy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/ready"]
       interval: 30s
       timeout: 5s
       start_period: 10s
