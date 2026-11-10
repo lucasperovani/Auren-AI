@@ -185,6 +185,35 @@ pub async fn update_agent(
             .bind(i).bind(&now).bind(&agent_id).execute(&state.db).await?;
     }
     if req.llm_provider_id.is_some() || req.model_id.is_some() {
+        // A model is only usable together with its provider: the runtime
+        // resolves provider_type/base_url through the agent's provider, so
+        // storing a model alone leaves the agent silently broken.
+        if let (Some(provider_id), Some(model_id)) = (&req.llm_provider_id, &req.model_id) {
+            let owner: Option<String> =
+                sqlx::query("SELECT user_id FROM llm_providers WHERE id = ?")
+                    .bind(provider_id)
+                    .fetch_optional(&state.db)
+                    .await?
+                    .and_then(|r| r.try_get("user_id").ok());
+            if owner.as_deref() != Some(user.id.as_str()) {
+                return Err(ApiError::NotFound);
+            }
+            let model_provider: Option<String> =
+                sqlx::query("SELECT provider_id FROM llm_models WHERE id = ?")
+                    .bind(model_id)
+                    .fetch_optional(&state.db)
+                    .await?
+                    .and_then(|r| r.try_get("provider_id").ok());
+            match model_provider.as_deref() {
+                Some(p) if p == provider_id => {}
+                Some(_) => {
+                    return Err(ApiError::Unprocessable(
+                        "model does not belong to the selected provider".into(),
+                    ))
+                }
+                None => return Err(ApiError::NotFound),
+            }
+        }
         sqlx::query("UPDATE agents SET llm_provider_id = COALESCE(?, llm_provider_id), model_id = COALESCE(?, model_id), updated_at = ? WHERE id = ?")
             .bind(&req.llm_provider_id).bind(&req.model_id).bind(&now).bind(&agent_id).execute(&state.db).await?;
     }

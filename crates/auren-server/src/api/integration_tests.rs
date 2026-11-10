@@ -866,6 +866,94 @@ async fn notes_links_and_activity_are_scoped_per_task() {
     let (_, links) = get_json(&app, &format!("/api/v1/tasks/{one_id}/links"), Some(&token)).await;
     assert!(links["outgoing"].as_array().unwrap().is_empty());
 }
+
+/// A model can only be assigned together with the provider that owns it.
+/// Storing a model with a null provider left the agent permanently unable to
+/// answer ("no LLM provider configured for this agent").
+#[tokio::test]
+async fn agent_model_requires_its_provider() {
+    let (app, _s, _d) = app().await;
+    let token = setup_and_login(&app).await;
+    let (_, agent) = post_json(&app, "/api/v1/agents", Some(&token), json!({ "name": "A" })).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+
+    let (status, provider) = post_json(
+        &app,
+        "/api/v1/llm/providers",
+        Some(&token),
+        json!({
+            "name": "Test",
+            "provider_type": "openai_compatible",
+            "base_url": "http://127.0.0.1:9/v1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+
+    let (status, model) = post_json(
+        &app,
+        &format!("/api/v1/llm/providers/{provider_id}/models"),
+        Some(&token),
+        json!({ "model_name": "test-model" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let model_id = model["id"].as_str().unwrap().to_string();
+
+    // A second provider that does not own the model.
+    let (_, other) = post_json(
+        &app,
+        "/api/v1/llm/providers",
+        Some(&token),
+        json!({
+            "name": "Other",
+            "provider_type": "openai_compatible",
+            "base_url": "http://127.0.0.1:9/v2"
+        }),
+    )
+    .await;
+    let other_id = other["id"].as_str().unwrap().to_string();
+
+    // A model from another provider is rejected instead of silently breaking
+    // the agent at answer time.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/agents/{agent_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "llm_provider_id": other_id, "model_id": model_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Assigning both together works and persists both sides.
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/agents/{agent_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "llm_provider_id": provider_id, "model_id": model_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, detail) = get_json(&app, &format!("/api/v1/agents/{agent_id}"), Some(&token)).await;
+    assert_eq!(detail["llm_provider_id"], provider_id);
+    assert_eq!(detail["model_id"], model_id);
+}
+
 #[tokio::test]
 async fn task_payload_exposes_schedule_and_last_run() {
     let (app, _s, _d) = app().await;

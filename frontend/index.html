@@ -4,47 +4,212 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Auren-AI</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="alternate icon" href="favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="favicon.ico">
+  <meta name="theme-color" content="#0b0d12">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div id="app">
     <!-- Login / setup gate -->
     <div id="auth-view" class="auth-view hidden">
-      <div class="auth-card">
-        <h1>Auren-AI</h1>
-        <p id="auth-subtitle" class="muted"></p>
-        <form id="auth-form">
-          <input id="auth-email" type="email" placeholder="Email" autocomplete="username" required>
-          <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password" required>
-          <input id="auth-display-name" type="text" placeholder="Display name" class="hidden">
-          <button id="auth-submit" type="submit">Sign in</button>
-        </form>
-        <p id="auth-error" class="error hidden"></p>
+      <div class="auth-shell">
+        <aside class="auth-aside">
+          <div class="auth-brand">
+            <span class="auth-mark" aria-hidden="true">
+              <svg viewBox="0 0 64 64" width="34" height="34">
+                <defs>
+                  <linearGradient id="authGrad" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0%" stop-color="#7ba3ff"/>
+                    <stop offset="100%" stop-color="#4b73e6"/>
+                  </linearGradient>
+                </defs>
+                <path d="M20 46 L32 18 L44 46" fill="none" stroke="url(#authGrad)"
+                      stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M25.5 36 H38.5" fill="none" stroke="#3ecf8e"
+                      stroke-width="4.5" stroke-linecap="round"/>
+                <circle cx="32" cy="18" r="3.2" fill="#3ecf8e"/>
+              </svg>
+            </span>
+            <span class="auth-brand-name">Auren<span>-AI</span></span>
+          </div>
+          <h1 class="auth-headline">Your work, <em>delegated</em>.</h1>
+          <p class="auth-lede">
+            An assistant that plans, executes and reports back — with an audit trail for
+            everything it touches.
+          </p>
+          <ul class="auth-points">
+            <li>
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12.5l5 5 11-11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Scheduled tasks that run on their own
+            </li>
+            <li>
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12.5l5 5 11-11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Approval gates before anything destructive
+            </li>
+            <li>
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12.5l5 5 11-11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Every tool call recorded and reviewable
+            </li>
+          </ul>
+        </aside>
+
+        <div class="auth-card">
+          <h2 id="auth-title">Sign in</h2>
+          <p id="auth-subtitle" class="muted"></p>
+          <form id="auth-form" novalidate>
+            <div class="field">
+              <label class="field-label" for="auth-email">Email</label>
+              <input id="auth-email" type="email" placeholder="you@example.com"
+                     autocomplete="username" required>
+            </div>
+            <div class="field">
+              <label class="field-label" for="auth-password">Password</label>
+              <input id="auth-password" type="password" placeholder="••••••••"
+                     autocomplete="current-password" required>
+            </div>
+            <div class="field hidden" id="auth-name-field">
+              <label class="field-label" for="auth-display-name">Display name</label>
+              <input id="auth-display-name" type="text" placeholder="How should we call you?"
+                     autocomplete="name">
+            </div>
+            <p id="auth-error" class="auth-error hidden" role="alert"></p>
+            <button id="auth-submit" type="submit">Sign in</button>
+          </form>
+        </div>
       </div>
     </div>
 
     <!-- Main application -->
     <div id="main-view" class="hidden">
       <header class="topbar">
-        <button class="menu-toggle" id="menu-toggle" aria-label="Toggle menu">☰</button>
-        <span class="brand">Auren-AI</span>
-        <button class="btn-ghost" id="sidebar-collapse" title="Show or hide the menu">◀</button>
+        <button class="icon-btn menu-toggle" id="menu-toggle" aria-label="Toggle navigation" aria-expanded="false">
+          <svg class="ico-menu" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <svg class="ico-close" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+
+        <span class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 64 64" width="22" height="22">
+              <defs>
+                <linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="#7ba3ff"/>
+                  <stop offset="100%" stop-color="#4b73e6"/>
+                </linearGradient>
+              </defs>
+              <path d="M20 46 L32 18 L44 46" fill="none" stroke="url(#brandGrad)"
+                    stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M25.5 36 H38.5" fill="none" stroke="#3ecf8e"
+                    stroke-width="4.5" stroke-linecap="round"/>
+              <circle cx="32" cy="18" r="3.2" fill="#3ecf8e"/>
+            </svg>
+          </span>
+          Auren<span class="brand-ai">-AI</span>
+        </span>
+
+        <button class="icon-btn collapse-btn" id="sidebar-collapse" title="Collapse sidebar" aria-label="Collapse sidebar">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path d="M14 6l-6 6 6 6" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M19 5v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+
         <span class="spacer"></span>
-        <span id="connection-status" class="conn-status" title="Live event channel">Offline</span>
+
+        <span id="connection-status" class="conn-status off" title="Live event channel"
+              role="status" aria-live="polite">
+          <span class="conn-dot" aria-hidden="true"></span>
+          <span class="conn-text">Offline</span>
+        </span>
+
         <span id="user-name" class="user-name"></span>
-        <button id="logout-btn" class="btn-ghost">Sign out</button>
+
+        <button id="logout-btn" class="icon-btn" title="Sign out" aria-label="Sign out">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3" fill="none"
+                  stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M10 8l-4 4 4 4M6 12h9" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
       </header>
+
       <nav class="sidebar" id="sidebar">
         <div class="nav-section">Workspace</div>
-        <a href="#dashboard" class="nav-link active" data-view="dashboard"><span class="nav-icon">◈</span>Dashboard</a>
-        <a href="#chat" class="nav-link" data-view="chat"><span class="nav-icon">✎</span>Chat</a>
-        <a href="#tasks" class="nav-link" data-view="tasks"><span class="nav-icon">◷</span>Tasks</a>
-        <a href="#notifications" class="nav-link" data-view="notifications"><span class="nav-icon">✉</span>Notifications<span id="notifications-badge" class="nav-badge hidden"></span></a>
-        <a href="#approvals" class="nav-link" data-view="approvals"><span class="nav-icon">✓</span>Approvals<span id="approvals-badge" class="nav-badge hidden"></span></a>
+        <a href="#dashboard" class="nav-link" data-view="dashboard">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          </svg>
+          Dashboard
+        </a>
+        <a href="#chat" class="nav-link" data-view="chat">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <path d="M20 15a2.5 2.5 0 0 1-2.5 2.5H8L4 21V6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5z"
+                  fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          </svg>
+          Chat
+        </a>
+        <a href="#tasks" class="nav-link" data-view="tasks">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <rect x="3.5" y="4.5" width="5" height="15" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <rect x="9.5" y="4.5" width="5" height="15" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <rect x="15.5" y="4.5" width="5" height="15" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          </svg>
+          Tasks
+        </a>
+        <a href="#notifications" class="nav-link" data-view="notifications">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <path d="M18 15.5V11a6 6 0 1 0-12 0v4.5L4.5 18h15z" fill="none"
+                  stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M9.5 20.5a2.7 2.7 0 0 0 5 0" fill="none" stroke="currentColor"
+                  stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+          Notifications<span id="notifications-badge" class="nav-badge hidden"></span>
+        </a>
+        <a href="#approvals" class="nav-link" data-view="approvals">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <path d="M12 3.5l7.5 3v5.2c0 4.3-3 7.6-7.5 8.8-4.5-1.2-7.5-4.5-7.5-8.8V6.5z"
+                  fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M8.8 12l2.3 2.3 4.1-4.4" fill="none" stroke="currentColor"
+                  stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Approvals<span id="approvals-badge" class="nav-badge hidden"></span>
+        </a>
+
         <div class="nav-section">Configure</div>
-        <a href="#skills" class="nav-link" data-view="skills"><span class="nav-icon">◆</span>Skills</a>
-        <a href="#integrations" class="nav-link" data-view="integrations"><span class="nav-icon">⇄</span>Integrations</a>
-        <a href="#settings" class="nav-link" data-view="settings"><span class="nav-icon">⚙</span>Settings</a>
+        <a href="#skills" class="nav-link" data-view="skills">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <path d="M12 3.2l2.6 5.6 6 .8-4.4 4.3 1.1 6L12 17l-5.3 2.9 1.1-6L3.4 9.6l6-.8z"
+                  fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+          </svg>
+          Skills
+        </a>
+        <a href="#integrations" class="nav-link" data-view="integrations">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <path d="M4 8h13l-3-3M20 16H7l3 3" fill="none" stroke="currentColor"
+                  stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Integrations
+        </a>
+        <a href="#settings" class="nav-link" data-view="settings">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M12 3.5v2.2M12 18.3v2.2M4.9 7.8l1.9 1.1M17.2 15.1l1.9 1.1M4.9 16.2l1.9-1.1M17.2 8.9l1.9-1.1"
+                  fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+          Settings
+        </a>
       </nav>
       <main class="content" id="content"></main>
     </div>

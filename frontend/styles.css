@@ -89,33 +89,115 @@ body::before {
   padding: 24px;
 }
 
-.auth-card {
+/* Two-panel layout: brand story on the left, form on the right. */
+.auth-shell {
+  display: grid;
+  grid-template-columns: 1.05fr 0.95fr;
   width: 100%;
-  max-width: 400px;
-  padding: 36px;
-  background: linear-gradient(180deg, var(--surface), var(--bg-elevated));
+  max-width: 920px;
+  overflow: hidden;
+  background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: 20px;
   box-shadow: var(--shadow-lg);
 }
 
-.auth-card h1 {
-  font-size: 1.6rem;
+.auth-aside {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 18px;
+  padding: 44px 40px;
+  background:
+    radial-gradient(600px 300px at 15% 0%, rgba(91, 140, 255, 0.16), transparent 70%),
+    radial-gradient(400px 260px at 90% 100%, rgba(62, 207, 142, 0.10), transparent 70%),
+    var(--surface);
+  border-right: 1px solid var(--border);
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.auth-brand-name {
+  font-size: 1.12rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.auth-brand-name span { color: var(--accent); }
+
+.auth-headline {
+  font-size: 1.85rem;
+  line-height: 1.22;
+  letter-spacing: -0.03em;
+  font-weight: 700;
+}
+
+.auth-headline em {
+  font-style: normal;
+  color: var(--accent);
+}
+
+.auth-lede {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--text-soft);
+  max-width: 38ch;
+}
+
+.auth-points {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 4px;
+  list-style: none;
+}
+
+.auth-points li {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.auth-points svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--success);
+}
+
+.auth-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 44px 40px;
+}
+
+.auth-card h2 {
+  font-size: 1.35rem;
   letter-spacing: -0.02em;
   margin-bottom: 6px;
 }
 
-.auth-card p { margin-bottom: 24px; font-size: 0.92rem; }
+.auth-card > p { margin-bottom: 24px; font-size: 0.88rem; }
+
+/* Fields share one visual language with the rest of the app. */
+.field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 15px; }
 
 .auth-card input {
   width: 100%;
   padding: 12px 14px;
-  margin-bottom: 12px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text);
-  font-size: 0.95rem;
+  font-size: 0.94rem;
+  font-family: inherit;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
@@ -125,21 +207,50 @@ body::before {
   box-shadow: var(--ring);
 }
 
-.auth-card button {
+.auth-card button[type='submit'] {
   width: 100%;
   padding: 12px;
-  margin-top: 4px;
+  margin-top: 6px;
   background: var(--accent);
   color: #fff;
   border: none;
   border-radius: var(--radius-sm);
-  font-size: 0.95rem;
-  font-weight: 600;
+  font-size: 0.93rem;
+  font-weight: 650;
+  font-family: inherit;
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: background 0.15s ease, opacity 0.15s ease;
 }
 
-.auth-card button:hover { background: var(--accent-hover); }
+.auth-card button[type='submit']:hover { background: var(--accent-hover); }
+.auth-card button[type='submit']:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.auth-error {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: var(--danger-soft);
+  border: 1px solid rgba(255, 95, 109, 0.35);
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+@media (max-width: 820px) {
+  .auth-shell {
+    grid-template-columns: 1fr;
+    max-width: 440px;
+  }
+  /* The brand panel is decorative; the form gets the whole card on mobile. */
+  .auth-aside {
+    padding: 28px 26px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .auth-headline { font-size: 1.4rem; }
+  .auth-points { display: none; }
+  .auth-card { padding: 30px 26px; }
+}
 
 /* ---------------------------------------------------------------------------
    App shell
@@ -151,10 +262,10 @@ body::before {
   z-index: 20;
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   height: var(--topbar-height);
-  padding: 0 20px;
-  background: rgba(18, 21, 29, 0.85);
+  padding: 0 16px;
+  background: rgba(18, 21, 29, 0.88);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border);
 }
@@ -162,52 +273,131 @@ body::before {
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
+  margin-left: 2px;
   font-weight: 700;
-  font-size: 1.02rem;
-  letter-spacing: -0.01em;
+  font-size: 1rem;
+  letter-spacing: -0.015em;
+  white-space: nowrap;
 }
 
-.brand::before {
-  content: "";
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 12px var(--accent);
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
 }
 
+.brand-ai { color: var(--accent); }
+
+/* Icon buttons: one consistent hit area for every topbar action. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-soft);
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.icon-btn:hover {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+
+.icon-btn:focus-visible {
+  outline: none;
+  color: var(--text);
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+/* The collapse arrow flips to point the other way when the sidebar is hidden. */
+.collapse-btn svg { transition: transform 0.22s ease; }
+.collapse-btn.is-collapsed svg { transform: rotate(180deg); }
+
+/* On desktop the collapse control is the primary way to hide the sidebar. */
+@media (min-width: 769px) {
+  .menu-toggle { display: none; }
+}
+
+/* Connection indicator: colored dot plus a label that always matches it. */
 .conn-status {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 0.78rem;
-  color: var(--muted);
-  padding: 4px 10px;
+  gap: 7px;
+  padding: 5px 11px 5px 9px;
   border: 1px solid var(--border);
   border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
-.conn-status::before {
-  content: "";
-  width: 6px;
-  height: 6px;
+.conn-dot {
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  background: var(--muted);
+  background: currentColor;
+  flex-shrink: 0;
 }
 
-.conn-status.live { color: var(--success); border-color: rgba(62, 207, 142, 0.3); }
-.conn-status.live::before { background: var(--success); box-shadow: 0 0 8px var(--success); }
-.conn-status.off { color: var(--danger); border-color: rgba(255, 95, 109, 0.3); }
-.conn-status.off::before { background: var(--danger); }
+.conn-status.live {
+  color: var(--success);
+  border-color: rgba(62, 207, 142, 0.34);
+  background: var(--success-soft);
+}
+
+/* A soft pulse makes "live" obvious without being distracting. */
+.conn-status.live .conn-dot {
+  animation: conn-pulse 2.4s ease-out infinite;
+}
+
+@keyframes conn-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(62, 207, 142, 0.5); }
+  70% { box-shadow: 0 0 0 5px rgba(62, 207, 142, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(62, 207, 142, 0); }
+}
+
+.conn-status.connecting {
+  color: var(--warning);
+  border-color: rgba(255, 180, 84, 0.34);
+  background: var(--warning-soft);
+}
+
+.conn-status.off {
+  color: var(--danger);
+  border-color: rgba(255, 95, 109, 0.32);
+  background: var(--danger-soft);
+}
 
 .user-name {
-  font-size: 0.88rem;
+  font-size: 0.85rem;
   color: var(--text-soft);
-  max-width: 180px;
+  max-width: 160px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@media (max-width: 620px) {
+  /* The text label is redundant once the dot carries the state. */
+  .conn-text { display: none; }
+  .conn-status { padding: 7px; }
+  .user-name { display: none; }
 }
 
 .btn-ghost {
@@ -223,15 +413,10 @@ body::before {
 
 .btn-ghost:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-2); }
 
-.menu-toggle {
-  display: none;
-  background: none;
-  border: none;
-  color: var(--text);
-  font-size: 1.3rem;
-  cursor: pointer;
-  padding: 4px 6px;
-}
+/* The mobile menu button swaps its icon: hamburger closed, X when open. */
+.menu-toggle .ico-close { display: none; }
+body.menu-open .menu-toggle .ico-menu { display: none; }
+body.menu-open .menu-toggle .ico-close { display: block; }
 
 /* Sidebar */
 
@@ -1022,6 +1207,89 @@ body.sidebar-collapsed .content { margin-left: 0; }
   word-break: break-word;
 }
 
+/* ---------------------------------------------------------------------------
+   Checkboxes and switches
+   --------------------------------------------------------------------------- */
+
+/* Native checkboxes ignore the theme, so they are replaced with an inline
+   SVG check drawn over a styled box. `appearance: none` keeps keyboard and
+   screen-reader behavior intact. */
+input[type='checkbox'] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  background: var(--surface-2);
+  border: 1.5px solid var(--border-strong);
+  border-radius: 5px;
+  cursor: pointer;
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+input[type='checkbox']:hover { border-color: var(--accent); }
+
+input[type='checkbox']:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+input[type='checkbox']:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* The check mark is drawn with two borders rotated 45°, which scales cleanly
+   at any zoom level and needs no image. */
+input[type='checkbox']:checked::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 1.5px;
+  width: 5px;
+  height: 9px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+/* Indeterminate state (mixed per-chat override): a dash. */
+input[type='checkbox']:indeterminate {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+input[type='checkbox']:indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 7px;
+  width: 8px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+
+input[type='checkbox']:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* A checkbox followed by text: align the pair and make the label clickable. */
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.check-row input[type='checkbox'] { margin-top: 2px; }
+
 /* Tables */
 .table {
   width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.89rem;
@@ -1283,7 +1551,9 @@ body.sidebar-collapsed .content { margin-left: 0; }
 }
 
 @media (max-width: 768px) {
-  .menu-toggle { display: block; }
+  /* Mobile uses the hamburger; the desktop collapse arrow is redundant. */
+  .menu-toggle { display: inline-flex; }
+  .collapse-btn { display: none; }
   .sidebar {
     transform: translateX(-100%); background: var(--bg-elevated);
     box-shadow: var(--shadow-lg); z-index: 25;

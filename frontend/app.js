@@ -239,28 +239,40 @@ async function showAuth() {
   document.getElementById('main-view').classList.add('hidden');
   document.getElementById('auth-view').classList.remove('hidden');
   const { setup_required: setupRequired } = await api('GET', '/auth/setup-status');
+  const title = document.getElementById('auth-title');
   const subtitle = document.getElementById('auth-subtitle');
-  const displayName = document.getElementById('auth-display-name');
+  const nameField = document.getElementById('auth-name-field');
   const submit = document.getElementById('auth-submit');
   if (setupRequired) {
-    subtitle.textContent = 'Create the administrator account to get started.';
-    displayName.classList.remove('hidden');
+    title.textContent = 'Create your account';
+    subtitle.textContent = 'This instance has no administrator yet. Set one up to get started.';
+    nameField.classList.remove('hidden');
     submit.textContent = 'Create account';
   } else {
+    title.textContent = 'Welcome back';
     subtitle.textContent = 'Sign in to your workspace.';
-    displayName.classList.add('hidden');
+    nameField.classList.add('hidden');
     submit.textContent = 'Sign in';
   }
   document.getElementById('auth-form').dataset.mode = setupRequired ? 'setup' : 'login';
+  document.getElementById('auth-email').focus();
 }
 
 document.getElementById('auth-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const errorEl = document.getElementById('auth-error');
+  const submit = document.getElementById('auth-submit');
   errorEl.classList.add('hidden');
   const form = event.target;
   const email = document.getElementById('auth-email').value.trim();
   const password = document.getElementById('auth-password').value;
+  if (!email || !password) {
+    errorEl.textContent = 'Email and password are required.';
+    errorEl.classList.remove('hidden');
+    return;
+  }
+  submit.disabled = true;
+  submit.textContent = form.dataset.mode === 'setup' ? 'Creating…' : 'Signing in…';
   try {
     if (form.dataset.mode === 'setup') {
       const displayName = document.getElementById('auth-display-name').value.trim();
@@ -272,6 +284,9 @@ document.getElementById('auth-form').addEventListener('submit', async (event) =>
   } catch (err) {
     errorEl.textContent = err.message;
     errorEl.classList.remove('hidden');
+  } finally {
+    submit.disabled = false;
+    submit.textContent = form.dataset.mode === 'setup' ? 'Create account' : 'Sign in';
   }
 });
 
@@ -298,7 +313,10 @@ async function enterApp() {
   const applyCollapse = (collapsed) => {
     sidebar.classList.toggle('collapsed', collapsed);
     document.body.classList.toggle('sidebar-collapsed', collapsed);
-    collapseBtn.textContent = collapsed ? '▶' : '◀';
+    // The arrow points toward the action: right to reopen, left to close.
+    collapseBtn.classList.toggle('is-collapsed', collapsed);
+    collapseBtn.title = collapsed ? 'Show sidebar' : 'Hide sidebar';
+    collapseBtn.setAttribute('aria-label', collapseBtn.title);
     sessionStorage.setItem('auren_sidebar_collapsed', collapsed ? '1' : '');
   };
   collapseBtn.onclick = () => applyCollapse(!sidebar.classList.contains('collapsed'));
@@ -317,7 +335,10 @@ document.querySelectorAll('.nav-link').forEach((link) => {
   });
 });
 document.getElementById('menu-toggle').addEventListener('click', () => {
-  document.getElementById('sidebar').classList.toggle('open');
+  const sidebar = document.getElementById('sidebar');
+  const open = sidebar.classList.toggle('open');
+  document.getElementById('menu-toggle').setAttribute('aria-expanded', String(open));
+  document.body.classList.toggle('menu-open', open);
 });
 
 function navigate(view) {
@@ -333,15 +354,37 @@ function navigate(view) {
 // WebSocket live events (docs/api/websocket.md)
 // ---------------------------------------------------------------------------
 
+/// Single source of truth for the live-channel indicator. The class and the
+/// visible label are always set together: updating only the class left the
+/// dot green while the text still said "Offline".
+function setConnectionStatus(state) {
+  const el = document.getElementById('connection-status');
+  if (!el) return;
+  const labels = {
+    live: 'Live',
+    connecting: 'Connecting…',
+    off: 'Offline',
+  };
+  el.className = `conn-status ${state}`;
+  const text = el.querySelector('.conn-text');
+  if (text) text.textContent = labels[state] || labels.off;
+  el.title = state === 'live'
+    ? 'Connected — live updates are streaming'
+    : state === 'connecting'
+      ? 'Connecting to the live event channel…'
+      : 'Disconnected — attempting to reconnect';
+}
+
 async function connectWebSocket() {
   if (ws) ws.close();
+  setConnectionStatus('connecting');
   try {
     const { ticket } = await api('POST', '/events/ticket', { session_token: sessionToken });
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/api/v1/events?ticket=${encodeURIComponent(ticket)}`);
     ws.onopen = () => {
       wsReconnectDelay = 1000;
-      document.getElementById('connection-status').className = 'conn-status live';
+      setConnectionStatus('live');
     };
     ws.onmessage = (event) => {
       try {
@@ -350,13 +393,13 @@ async function connectWebSocket() {
       } catch { /* ignore malformed frames */ }
     };
     ws.onclose = () => {
-      document.getElementById('connection-status').className = 'conn-status off';
+      setConnectionStatus('off');
       // Reconnect with exponential backoff; state is re-fetched from REST.
       setTimeout(connectWebSocket, wsReconnectDelay);
       wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
     };
   } catch {
-    document.getElementById('connection-status').className = 'conn-status off';
+    setConnectionStatus('off');
     setTimeout(connectWebSocket, wsReconnectDelay);
     wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
   }
@@ -544,8 +587,9 @@ views.chat = async (content) => {
           </select>
           <button class="btn btn-sm btn-secondary" id="chat-model-save" style="display:none">Save</button>
           <span class="spacer"></span>
-          <label class="muted" style="font-size:.85rem; display:flex; align-items:center; gap:6px; cursor:pointer" title="Run tool executions in this chat without asking for approval">
-            <input type="checkbox" id="chat-auto-approve"> Auto-approve
+          <label class="check-row muted" style="font-size:.85rem" title="Run tool executions in this chat without asking for approval">
+            <input type="checkbox" id="chat-auto-approve">
+            <span>Auto-approve</span>
           </label>
         </div>
         <div class="chat-messages" id="chat-messages"></div>
@@ -567,14 +611,29 @@ views.chat = async (content) => {
     } catch { chatModels[p.id] = []; }
   }));
   modelSelect.innerHTML = '<option value="">Default</option>' +
-    providers.items.flatMap((p) => (chatModels[p.id] || []).map((m) => `<option value="${esc(m.id)}">${esc(p.name)} / ${esc(m.model_name)}</option>`)).join('');
-  // Reflect the agent's current model.
+    providers.items.flatMap((p) => (chatModels[p.id] || []).map((m) => `<option value="${esc(p.id)}|${esc(m.id)}">${esc(p.name)} / ${esc(m.model_name)}</option>`)).join('');
+  // Reflect the agent's current model. The provider is part of the value so
+  // saving always sends both: a model alone leaves the agent unusable.
   const agentDetail = await api('GET', `/agents/${defaultAgent.id}`);
-  modelSelect.value = agentDetail.model_id || '';
+  modelSelect.value = agentDetail.model_id
+    ? `${agentDetail.llm_provider_id || ''}|${agentDetail.model_id}`
+    : '';
   modelSelect.addEventListener('change', () => { saveBtn.style.display = ''; });
   saveBtn.addEventListener('click', async () => {
+    const [providerId, modelId] = (modelSelect.value || '').split('|');
+    if (!modelId) {
+      toast('Pick a model, or add a provider in Settings first', 'error');
+      return;
+    }
+    if (!providerId) {
+      toast('This model has no provider; re-add it in Settings', 'error');
+      return;
+    }
     try {
-      await api('PATCH', `/agents/${defaultAgent.id}`, { model_id: modelSelect.value || null });
+      await api('PATCH', `/agents/${defaultAgent.id}`, {
+        llm_provider_id: providerId,
+        model_id: modelId,
+      });
       toast('Model saved', 'success');
       saveBtn.style.display = 'none';
     } catch (err) { toast(err.message, 'error'); }
@@ -2404,7 +2463,7 @@ views.settings = async (content) => {
 
     <h3 class="section-title">Executions</h3>
     <div class="card" style="margin-bottom:20px">
-      <label style="display:flex; align-items:center; gap:10px; cursor:pointer">
+      <label class="check-row">
         <input type="checkbox" id="auto-approve-global" ${autoApprove.enabled ? 'checked' : ''}>
         <span>Run all tool executions without asking for approval</span>
       </label>
